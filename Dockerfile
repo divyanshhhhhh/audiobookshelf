@@ -6,7 +6,10 @@ FROM node:20-alpine AS build-client
 
 WORKDIR /client
 COPY client/package*.json /client/
-RUN npm ci --only=production && npm cache clean --force
+
+# Install ALL dependencies (dev dependencies needed for build)
+RUN npm ci && npm cache clean --force
+
 COPY client/ /client/
 RUN npm run generate
 
