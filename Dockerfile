@@ -5,8 +5,9 @@ ARG NUSQLITE3_PATH="${NUSQLITE3_DIR}/libnusqlite3.so"
 FROM node:20-alpine AS build-client
 
 WORKDIR /client
-COPY /client /client
-RUN npm ci && npm cache clean --force
+COPY client/package*.json /client/
+RUN npm ci --only=production && npm cache clean --force
+COPY client/ /client/
 RUN npm run generate
 
 ### STAGE 1: Build server ###
@@ -25,9 +26,13 @@ RUN apk add --no-cache --update \
   unzip
 
 WORKDIR /server
-COPY index.js package* /server
-COPY /server /server/server
 
+# Copy server files correctly
+COPY server/package*.json /server/
+COPY server/index.js /server/
+COPY server/ /server/
+
+# Download nusqlite3 library
 RUN case "$TARGETPLATFORM" in \
   "linux/amd64") \
   curl -L -o /tmp/library.zip "https://github.com/mikiher/nunicode-sqlite/releases/download/v1.2/libnusqlite3-linux-musl-x64.zip" ;; \
