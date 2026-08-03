@@ -1,0 +1,76 @@
+---
+- name: Automated secure deployment of Audiobookshelf (Part 2)
+  hosts: local
+  become: true
+  vars_files:
+    - secrets.yml   # created via `ansible-vault create ansible/secrets.yml` — do not commit plaintext
+
+  tasks:
+    - name: Ensure OS packages are up to date
+      apt:
+        update_cache: yes
+        upgrade: dist
+      when: ansible_os_family == "Debian"
+
+    - name: Ensure Docker is installed
+      apt:
+        name:
+          - docker.io
+          - docker-compose-plugin
+        state: present
+
+    - name: Ensure Docker service is running
+      service:
+        name: docker
+        state: started
+        enabled: true
+
+    - name: Create deployment directory
+      file:
+        path: /opt/abs-hardened
+        state: directory
+        mode: "0750"
+
+    - name: Copy hardened compose file
+      copy:
+        src: ../docker/docker-compose.hardened.yml
+        dest: /opt/abs-hardened/docker-compose.yml
+        mode: "0640"
+
+    - name: Copy Caddy config (HTTPS + secure headers)
+      copy:
+        src: ../docker/Caddyfile
+        dest: /opt/abs-hardened/Caddyfile
+        mode: "0640"
+
+    - name: Ensure data directories exist with correct ownership
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: "1000"
+        group: "1000"
+        mode: "0750"
+      loop:
+        - /home/pawan/audiobookshelf/config
+        - /home/pawan/audiobookshelf/metadata
+
+    - name: Pull latest images
+      command: docker compose -f /opt/abs-hardened/docker-compose.yml pull
+
+    - name: Deploy hardened stack
+      command: docker compose -f /opt/abs-hardened/docker-compose.yml up -d
+
+    - name: Wait for healthcheck to pass
+      shell: docker inspect --format='{{"{{"}}.State.Health.Status{{"}}"}}' abs-hardened
+      register: health
+      until: health.stdout == "healthy"
+      retries: 10
+      delay: 5
+
+    - name: Verify network access controls (only expected ports exposed)
+      command: docker port abs-caddy
+      register: ports_out
+
+    - name: Show exposed ports (for audit trail / screenshot evidence)
+      debug:
+        var: ports_out.stdout_lines

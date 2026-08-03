@@ -1,0 +1,33 @@
+# Enforce HTTPS + secure headers + restrict sensitive endpoints
+# Replace localhost with your real hostname for a trusted cert in production use.
+
+:80 {
+	redir https://{host}:13443{uri} permanent
+}
+
+:443 {
+	tls internal   # swap for a real cert (Let's Encrypt) once you have a public domain
+
+	encode gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer-when-downgrade"
+		Content-Security-Policy "default-src 'self'; img-src 'self' data:; script-src 'self'"
+		-Server
+	}
+
+	# Restrict access to admin/config endpoints to local network only
+	@adminPaths path /config* /api/settings*
+	handle @adminPaths {
+		@notLocal not remote_ip 192.168.0.0/16 10.0.0.0/8
+		respond @notLocal 403
+		reverse_proxy audiobookshelf:80
+	}
+
+	handle {
+		reverse_proxy audiobookshelf:80
+	}
+}

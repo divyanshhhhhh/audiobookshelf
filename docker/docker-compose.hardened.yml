@@ -1,0 +1,70 @@
+version: "3.9"
+
+networks:
+  abs-internal:
+    driver: bridge
+    internal: false   # caddy needs egress for ACME; app itself stays unpublished directly
+
+services:
+  audiobookshelf:
+    image: advplyr/audiobookshelf:latest
+    container_name: abs-hardened
+    restart: unless-stopped
+    environment:
+      - NODE_ENV=production        # disable debug mode
+      - PUID=1000
+      - PGID=1000
+    volumes:
+      - /home/pawan/audiobookshelf/config:/config
+      - /home/pawan/audiobookshelf/metadata:/metadata
+      - /home/pawan/audiobookshelf/audiobooks:/audiobooks:ro
+      - /home/pawan/audiobookshelf/podcasts:/podcasts:ro
+    # No direct host port publish — only reachable via Caddy reverse proxy below
+    expose:
+      - "80"
+    networks:
+      - abs-internal
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+    read_only: false   # app writes to /config and /metadata; keep false but rely on cap_drop + volumes for containment
+    tmpfs:
+      - /tmp
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:80/healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1g
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: abs-caddy
+    restart: unless-stopped
+    ports:
+      - "13380:80"     # keep matching your existing exposed port
+      - "13443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - abs-internal
+    depends_on:
+      audiobookshelf:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  caddy_data:
+  caddy_config:
