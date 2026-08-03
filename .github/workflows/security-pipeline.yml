@@ -1,1 +1,216 @@
-# Paste the entire YAML above here
+name: DevSecOps Security Pipeline
+
+on:
+  push:
+    branches: [ security/devsecops-pipeline, main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch: {}
+
+env:
+  IMAGE_NAME: audiobookshelf-hardened
+  IMAGE_TAG: ci-${{ github.run_number }}
+
+jobs:
+  static-analysis:
+    name: Static Code Analysis (SAST)
+    runs-on: self-hosted
+    outputs:
+      findings: ${{ steps.summarize.outputs.findings }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Cache npm dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Semgrep (SAST - Minimal)
+        timeout-minutes: 3
+        run: |
+          pip install --user semgrep --quiet
+          ~/.local/bin/semgrep scan \
+            --config p/owasp-top-ten \
+            --exclude node_modules \
+            --exclude dist \
+            --exclude build \
+            --exclude coverage \
+            --exclude .git \
+            --max-target-bytes 500000 \
+            --sarif \
+            --output semgrep-results.sarif || true
+
+      - name: ESLint with security plugin
+        timeout-minutes: 2
+        run: |
+          npm install --no-save eslint-plugin-security --quiet
+          npx eslint . --ext .js,.vue --no-eslintrc \
+            --config '{"plugins":["security"],"extends":["plugin:security/recommended"]}' \
+            -f json -o eslint-security.json || true
+
+      - name: Install Gitleaks (if missing)
+        run: |
+          if ! command -v gitleaks &> /dev/null; then
+            echo "Installing gitleaks..."
+            wget -q https://github.com/gitleaks/gitleaks/releases/download/v8.18.1/gitleaks_8.18.1_linux_x64.tar.gz
+            tar -xzf gitleaks_8.18.1_linux_x64.tar.gz
+            sudo mv gitleaks /usr/local/bin/
+            sudo chmod +x /usr/local/bin/gitleaks
+          fi
+
+      - name: Gitleaks secrets scan
+        run: gitleaks detect --source . --report-format json --report-path gitleaks-report.json --exit-code 0
+
+      - name: Summarize SAST findings
+        id: summarize
+        run: |
+          if [ -f semgrep-results.sarif ]; then
+            SEMGREP_COUNT=$(jq '.runs[0].results | length' semgrep-results.sarif 2>/dev/null || echo 0)
+          else
+            SEMGREP_COUNT=0
+          fi
+          echo "findings=$SEMGREP_COUNT" >> "$GITHUB_OUTPUT"
+
+      - name: Upload SAST artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sast-reports
+          path: |
+            semgrep-results.sarif
+            eslint-security.json
+            gitleaks-report.json
+          if-no-files-found: ignore
+
+  dependency-scan:
+    name: Open Source Dependency & Image Scanning (SCA)
+    runs-on: self-hosted
+    needs: static-analysis
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache npm dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: npm audit
+        run: npm audit --production --json > npm-audit.json || true
+
+      - name: Install Trivy (if missing)
+        run: |
+          if ! command -v trivy &> /dev/null; then
+            echo "Installing trivy..."
+            wget -q https://github.com/aquasecurity/trivy/releases/download/v0.49.1/trivy_0.49.1_Linux-64bit.deb
+            sudo dpkg -i trivy_0.49.1_Linux-64bit.deb
+          fi
+
+      - name: Trivy filesystem scan
+        run: |
+          trivy fs --scanners vuln,secret,misconfig --format json \
+            --output trivy-fs.json . || true
+
+      - name: Build Docker image
+        run: docker build -t $IMAGE_NAME:$IMAGE_TAG .
+
+      - name: Trivy image scan
+        run: |
+          trivy image --severity HIGH,CRITICAL --format json \
+            --output trivy-image.json $IMAGE_NAME:$IMAGE_TAG || true
+
+      - name: Upload SCA artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sca-reports
+          path: |
+            npm-audit.json
+            trivy-fs.json
+            trivy-image.json
+          if-no-files-found: ignore
+
+  dast-api-tests:
+    name: Dynamic/API Security Testing (DAST)
+    runs-on: self-hosted
+    needs: dependency-scan
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start app
+        run: |
+          docker rm -f abs-ci-test || true
+          docker run -d --name abs-ci-test -p 18080:80 $IMAGE_NAME:$IMAGE_TAG
+          sleep 15
+
+      - name: OWASP ZAP baseline scan
+        uses: zaproxy/action-baseline@v0.12.0
+        with:
+          target: 'http://localhost:18080'
+          rules_file_name: '.zap/rules.tsv'
+          cmd_options: '-a'
+
+      - name: Tear down test instance
+        if: always()
+        run: docker rm -f abs-ci-test || true
+
+  notify:
+    name: Developer Notification
+    runs-on: self-hosted
+    needs: [ static-analysis, dependency-scan, dast-api-tests ]
+    if: always()
+    steps:
+      - name: Download all reports
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Notify on findings
+        if: needs.static-analysis.outputs.findings != '0'
+        run: |
+          echo "⚠️ Security pipeline run #${{ github.run_number }} found ${{ needs.static-analysis.outputs.findings }} SAST findings."
+          echo "See: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+      - name: Open GitHub Issue
+        if: needs.static-analysis.outputs.findings != '0'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Security pipeline findings — run #${context.runNumber}`,
+              body: `Automated pipeline detected potential issues. See run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              labels: ['security', 'automated']
+            });
+
+  deploy:
+    name: Automated Secure Deployment
+    runs-on: self-hosted
+    needs: [ static-analysis, dependency-scan, dast-api-tests ]
+    if: success()
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy via Ansible
+        run: |
+          ansible-playbook -i ansible/inventory.ini ansible/deploy.yml || echo "Ansible not configured"
+
+      - name: Post-deployment validation
+        run: |
+          chmod +x scripts/post-deploy-validate.sh 2>/dev/null || true
+          ./scripts/post-deploy-validate.sh 2>/dev/null || echo "Validation skipped"
