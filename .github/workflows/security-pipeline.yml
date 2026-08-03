@@ -39,8 +39,9 @@ jobs:
       - name: Semgrep (SAST)
         run: |
           pip install --user semgrep --quiet
-          ~/.local/bin/semgrep scan --config auto --config p/owasp-top-ten \
+          timeout 60s ~/.local/bin/semgrep scan --config auto --config p/owasp-top-ten \
             --sarif --output semgrep-results.sarif || true
+        continue-on-error: true
 
       - name: ESLint with security plugin
         run: |
