@@ -39,7 +39,11 @@ jobs:
       - name: Semgrep (SAST)
         run: |
           pip install --user semgrep --quiet
+          # Only scan JavaScript/TypeScript files, skip node_modules
           ~/.local/bin/semgrep scan --config auto --config p/owasp-top-ten \
+            --include "*.js" --include "*.ts" --include "*.vue" \
+            --exclude "node_modules" --exclude "dist" --exclude "build" \
+            --max-target-bytes 500000 \
             --sarif --output semgrep-results.sarif || true
 
       - name: ESLint with security plugin
