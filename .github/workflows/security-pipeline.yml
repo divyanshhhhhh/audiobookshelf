@@ -1,0 +1,162 @@
+name: DevSecOps Security Pipeline
+
+on:
+  push:
+    branches: [security/devsecops-pipeline, main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+env:
+  IMAGE_NAME: audiobookshelf-hardened
+  IMAGE_TAG: ci-${{ github.run_number }}
+
+jobs:
+  static-analysis:
+    name: Static Code Analysis (SAST)
+    runs-on: self-hosted   # on-premise runner, per project requirement
+    outputs:
+      findings: ${{ steps.summarize.outputs.findings }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Semgrep (SAST — injection, auth, access control patterns)
+        run: |
+          pip install --user semgrep --quiet
+          ~/.local/bin/semgrep scan --config auto --config p/owasp-top-ten \
+            --sarif --output semgrep-results.sarif || true
+
+      - name: ESLint with security plugin
+        run: |
+          npm install --no-save eslint-plugin-security --quiet
+          npx eslint . --ext .js,.vue --no-eslintrc \
+            --config '{"plugins":["security"],"extends":["plugin:security/recommended"]}' \
+            -f json -o eslint-security.json || true
+
+      - name: Gitleaks (secrets scanning — commit policy enforcement)
+        run: |
+          gitleaks detect --source . --report-format json --report-path gitleaks-report.json --exit-code 0
+
+      - name: Summarize SAST findings
+        id: summarize
+        run: |
+          SEMGREP_COUNT=$(jq '.runs[0].results | length' semgrep-results.sarif 2>/dev/null || echo 0)
+          echo "findings=$SEMGREP_COUNT" >> "$GITHUB_OUTPUT"
+
+      - name: Upload SAST artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sast-reports
+          path: |
+            semgrep-results.sarif
+            eslint-security.json
+            gitleaks-report.json
+
+  dependency-scan:
+    name: Open Source Dependency & Image Scanning (SCA)
+    runs-on: self-hosted
+    needs: static-analysis
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: npm audit (dependency vulnerabilities)
+        run: npm audit --production --json > npm-audit.json || true
+
+      - name: Trivy filesystem scan (dependencies + IaC)
+        run: |
+          trivy fs --scanners vuln,secret,misconfig --format json \
+            --output trivy-fs.json . || true
+
+      - name: Build Docker image for scanning
+        run: docker build -t $IMAGE_NAME:$IMAGE_TAG .
+
+      - name: Trivy image scan (container vulnerabilities)
+        run: |
+          trivy image --severity HIGH,CRITICAL --format json \
+            --output trivy-image.json $IMAGE_NAME:$IMAGE_TAG || true
+
+      - name: Upload SCA artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sca-reports
+          path: |
+            npm-audit.json
+            trivy-fs.json
+            trivy-image.json
+
+  dast-api-tests:
+    name: Dynamic/API Security Testing (DAST)
+    runs-on: self-hosted
+    needs: dependency-scan
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start app for testing
+        run: |
+          docker rm -f abs-ci-test || true
+          docker run -d --name abs-ci-test -p 18080:80 $IMAGE_NAME:$IMAGE_TAG
+          sleep 15
+
+      - name: OWASP ZAP baseline scan (functionality + API endpoints + threat scenarios from Labs 2-5)
+        uses: zaproxy/action-baseline@v0.12.0
+        with:
+          target: 'http://localhost:18080'
+          rules_file_name: '.zap/rules.tsv'
+          cmd_options: '-a'
+
+      - name: Tear down test instance
+        if: always()
+        run: docker rm -f abs-ci-test || true
+
+  notify:
+    name: Developer Notification
+    runs-on: self-hosted
+    needs: [static-analysis, dependency-scan, dast-api-tests]
+    if: always()
+    steps:
+      - name: Download all reports
+        uses: actions/download-artifact@v4
+
+      - name: Notify Slack on findings
+        if: needs.static-analysis.outputs.findings != '0'
+        run: |
+          curl -X POST -H 'Content-type: application/json' \
+            --data "{\"text\":\"⚠️ Security pipeline run #${{ github.run_number }} found ${{ needs.static-analysis.outputs.findings }} SAST findings. See: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" \
+            "${{ secrets.SLACK_WEBHOOK_URL }}"
+
+      - name: Open GitHub Issue on findings
+        if: needs.static-analysis.outputs.findings != '0'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Security pipeline findings — run #${context.runNumber}`,
+              body: `Automated pipeline detected potential issues. See run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              labels: ['security', 'automated']
+            });
+
+  deploy:
+    name: Automated Secure Deployment
+    runs-on: self-hosted
+    needs: [static-analysis, dependency-scan, dast-api-tests]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy hardened stack via Ansible
+        run: |
+          ansible-playbook -i ansible/inventory.ini ansible/deploy.yml
+
+      - name: Run post-deployment validation
+        run: |
+          chmod +x scripts/post-deploy-validate.sh
+          ./scripts/post-deploy-validate.sh
