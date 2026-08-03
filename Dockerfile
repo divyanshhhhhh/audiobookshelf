@@ -27,12 +27,10 @@ RUN apk add --no-cache --update \
 
 WORKDIR /server
 
-# Copy server files correctly
 COPY server/package*.json /server/
 COPY server/index.js /server/
 COPY server/ /server/
 
-# Download nusqlite3 library
 RUN case "$TARGETPLATFORM" in \
   "linux/amd64") \
   curl -L -o /tmp/library.zip "https://github.com/mikiher/nunicode-sqlite/releases/download/v1.2/libnusqlite3-linux-musl-x64.zip" ;; \
@@ -51,7 +49,6 @@ FROM node:20-alpine
 ARG NUSQLITE3_DIR
 ARG NUSQLITE3_PATH
 
-# Install only runtime dependencies
 RUN apk add --no-cache --update \
   tzdata \
   ffmpeg \
@@ -59,7 +56,6 @@ RUN apk add --no-cache --update \
 
 WORKDIR /app
 
-# Copy compiled frontend and server from build stages
 COPY --from=build-client /client/dist /app/client/dist
 COPY --from=build-server /server /app
 COPY --from=build-server ${NUSQLITE3_PATH} ${NUSQLITE3_PATH}
