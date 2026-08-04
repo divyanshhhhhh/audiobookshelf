@@ -1,25 +1,34 @@
-version: "3.9"
+# Hardened runtime configuration for Audiobookshelf.
+#
+# Changes from the previous version:
+#   - removed the obsolete `version:` key (Compose v2 warns on it)
+#   - pinned the image tag instead of tracking :latest, per MAINTENANCE.md s2
+#   - added `user: "1000:1000"` so the container does not run as root, which is
+#     what scripts/post-deploy-validate.sh check 5 actually asserts
+#   - dropped cap_add entirely; those capabilities were only needed for a
+#     root process dropping privileges at startup
 
 networks:
   abs-internal:
     driver: bridge
-    internal: false   # caddy needs egress for ACME; app itself stays unpublished directly
+    internal: false   # Caddy needs egress for ACME; the app stays unpublished
 
 services:
   audiobookshelf:
-    image: advplyr/audiobookshelf:latest
+    image: advplyr/audiobookshelf:2.35.1
     container_name: abs-hardened
     restart: unless-stopped
+    user: "1000:1000"
     environment:
-      - NODE_ENV=production        # disable debug mode
+      - NODE_ENV=production        # debug mode disabled
       - PUID=1000
       - PGID=1000
     volumes:
-      - /home/pawan/audiobookshelf/config:/config
-      - /home/pawan/audiobookshelf/metadata:/metadata
-      - /home/pawan/audiobookshelf/audiobooks:/audiobooks:ro
-      - /home/pawan/audiobookshelf/podcasts:/podcasts:ro
-    # No direct host port publish — only reachable via Caddy reverse proxy below
+      - /home/ubuntu/abs-hardened-data/config:/config
+      - /home/ubuntu/abs-hardened-data/metadata:/metadata
+      - /home/ubuntu/abs-hardened-data/audiobooks:/audiobooks:ro
+      - /home/ubuntu/abs-hardened-data/podcasts:/podcasts:ro
+    # No direct host port publish; reachable only through the Caddy proxy.
     expose:
       - "80"
     networks:
@@ -28,11 +37,7 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
-    cap_add:
-      - CHOWN
-      - SETUID
-      - SETGID
-    read_only: false   # app writes to /config and /metadata; keep false but rely on cap_drop + volumes for containment
+    read_only: false   # app writes to /config and /metadata
     tmpfs:
       - /tmp
     healthcheck:
@@ -40,6 +45,7 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
+      start_period: 30s
     deploy:
       resources:
         limits:
@@ -51,7 +57,7 @@ services:
     container_name: abs-caddy
     restart: unless-stopped
     ports:
-      - "13380:80"     # keep matching your existing exposed port
+      - "13380:80"
       - "13443:443"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro

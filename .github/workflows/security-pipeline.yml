@@ -1,22 +1,36 @@
 name: DevSecOps Security Pipeline
 
+# Triggers target `master` because that is this repository's default branch.
+# The previous version targeted `main`, which does not exist here, so the
+# pull_request trigger never fired and PRs received no security status checks.
 on:
   push:
-    branches: [ security/devsecops-pipeline, main ]
+    branches: [ master, security/devsecops-pipeline, security/pipeline-fixes ]
   pull_request:
-    branches: [ main ]
+    branches: [ master ]
   workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: write
 
 env:
   IMAGE_NAME: audiobookshelf-hardened
   IMAGE_TAG: ci-${{ github.run_number }}
+  ZAP_NETWORK: abs-ci-net
+  APP_CONTAINER: abs-ci-test
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # 1. Static Application Security Testing
+  # ---------------------------------------------------------------------------
   static-analysis:
     name: Static Code Analysis (SAST)
     runs-on: self-hosted
     outputs:
-      findings: ${{ steps.summarize.outputs.findings }}
+      semgrep_findings: ${{ steps.summarize.outputs.semgrep_findings }}
+      eslint_findings: ${{ steps.summarize.outputs.eslint_findings }}
+      gitleaks_findings: ${{ steps.summarize.outputs.gitleaks_findings }}
     steps:
       - uses: actions/checkout@v4
 
@@ -36,53 +50,106 @@ jobs:
       - name: Install dependencies
         run: npm ci --no-audit --no-fund
 
-      - name: Semgrep (SAST - Minimal)
-        timeout-minutes: 3
+      # Semgrep runs from a throwaway virtualenv so the runner's system Python
+      # is never modified. The venv is removed at the end of the step.
+      - name: Semgrep (SAST)
+        timeout-minutes: 8
         run: |
-          pip install --user semgrep --quiet
-          ~/.local/bin/semgrep scan \
+          set -euo pipefail
+          python3 -m venv .semgrep-venv
+          ./.semgrep-venv/bin/pip install --quiet --upgrade pip
+          ./.semgrep-venv/bin/pip install --quiet semgrep
+          ./.semgrep-venv/bin/semgrep scan \
             --config p/owasp-top-ten \
+            --config p/javascript \
+            --config p/nodejs \
             --exclude node_modules \
+            --exclude client/dist \
             --exclude dist \
             --exclude build \
             --exclude coverage \
             --exclude .git \
-            --max-target-bytes 500000 \
+            --max-target-bytes 1000000 \
             --sarif \
-            --output semgrep-results.sarif || true
+            --output semgrep-results.sarif \
+            --error || SEMGREP_EXIT=$?
+          rm -rf .semgrep-venv
+          # semgrep --error exits 1 when findings exist. That is expected here;
+          # the notify job decides what to do about findings. Any other non-zero
+          # exit is a genuine tool failure and must fail the step.
+          if [ "${SEMGREP_EXIT:-0}" -gt 1 ]; then
+            echo "::error::Semgrep failed to run (exit ${SEMGREP_EXIT})"
+            exit 1
+          fi
+          test -s semgrep-results.sarif
 
+      # The repository has no ESLint dependency of its own, so versions are
+      # pinned here. eslint 9 removed --no-eslintrc and --ext, which is why the
+      # previous inline-config version of this step silently produced no output.
       - name: ESLint with security plugin
-        timeout-minutes: 2
+        timeout-minutes: 5
         run: |
-          npm install --no-save eslint-plugin-security --quiet
-          npx eslint . --ext .js,.vue --no-eslintrc \
-            --config '{"plugins":["security"],"extends":["plugin:security/recommended"]}' \
-            -f json -o eslint-security.json || true
+          set -euo pipefail
+          npm install --no-save --no-audit --no-fund \
+            eslint@8.57.0 eslint-plugin-security@2.1.1
+          npx eslint index.js server \
+            --no-eslintrc \
+            --config .eslintrc.security.json \
+            --ext .js \
+            -f json -o eslint-security.json || ESLINT_EXIT=$?
+          # eslint exits 1 when it reports problems, 2 on a config/crash error.
+          if [ "${ESLINT_EXIT:-0}" -gt 1 ]; then
+            echo "::error::ESLint failed to run (exit ${ESLINT_EXIT})"
+            exit 1
+          fi
+          # Guard against the previous silent-failure mode.
+          test -s eslint-security.json
 
       - name: Install Gitleaks (if missing)
         run: |
+          set -euo pipefail
           if ! command -v gitleaks &> /dev/null; then
-            echo "Installing gitleaks..."
             wget -q https://github.com/gitleaks/gitleaks/releases/download/v8.18.1/gitleaks_8.18.1_linux_x64.tar.gz
-            tar -xzf gitleaks_8.18.1_linux_x64.tar.gz
+            tar -xzf gitleaks_8.18.1_linux_x64.tar.gz gitleaks
             sudo mv gitleaks /usr/local/bin/
             sudo chmod +x /usr/local/bin/gitleaks
+            rm -f gitleaks_8.18.1_linux_x64.tar.gz
           fi
+          gitleaks version
 
       - name: Gitleaks secrets scan
-        run: gitleaks detect --source . --report-format json --report-path gitleaks-report.json --exit-code 0
+        run: |
+          set -euo pipefail
+          gitleaks detect --source . \
+            --report-format json \
+            --report-path gitleaks-report.json \
+            --exit-code 0
+          test -f gitleaks-report.json
 
       - name: Summarize SAST findings
         id: summarize
         run: |
-          if [ -f semgrep-results.sarif ]; then
-            SEMGREP_COUNT=$(jq '.runs[0].results | length' semgrep-results.sarif 2>/dev/null || echo 0)
-          else
-            SEMGREP_COUNT=0
-          fi
-          echo "findings=$SEMGREP_COUNT" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          SEMGREP=$(jq '.runs[0].results | length' semgrep-results.sarif)
+          ESLINT=$(jq '[.[].messages[]] | length' eslint-security.json)
+          GITLEAKS=$(jq 'length' gitleaks-report.json)
+
+          echo "semgrep_findings=$SEMGREP"   >> "$GITHUB_OUTPUT"
+          echo "eslint_findings=$ESLINT"     >> "$GITHUB_OUTPUT"
+          echo "gitleaks_findings=$GITLEAKS" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Static analysis"
+            echo ""
+            echo "| Tool | Findings |"
+            echo "|---|---:|"
+            echo "| Semgrep | $SEMGREP |"
+            echo "| ESLint (security plugin) | $ESLINT |"
+            echo "| Gitleaks | $GITLEAKS |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload SAST artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: sast-reports
@@ -90,12 +157,19 @@ jobs:
             semgrep-results.sarif
             eslint-security.json
             gitleaks-report.json
-          if-no-files-found: ignore
+          if-no-files-found: error
 
+  # ---------------------------------------------------------------------------
+  # 2. Software Composition Analysis and container image scanning
+  # ---------------------------------------------------------------------------
   dependency-scan:
     name: Open Source Dependency & Image Scanning (SCA)
     runs-on: self-hosted
     needs: static-analysis
+    outputs:
+      npm_critical: ${{ steps.summarize.outputs.npm_critical }}
+      npm_high: ${{ steps.summarize.outputs.npm_high }}
+      image_highcrit: ${{ steps.summarize.outputs.image_highcrit }}
     steps:
       - uses: actions/checkout@v4
 
@@ -111,30 +185,78 @@ jobs:
         run: npm ci --no-audit --no-fund
 
       - name: npm audit
-        run: npm audit --production --json > npm-audit.json || true
+        run: |
+          set -uo pipefail
+          # npm audit exits non-zero when vulnerabilities exist; the report is
+          # still written, so only a missing/empty report is a real failure.
+          npm audit --omit=dev --json > npm-audit.json || true
+          test -s npm-audit.json
 
       - name: Install Trivy (if missing)
         run: |
+          set -euo pipefail
           if ! command -v trivy &> /dev/null; then
-            echo "Installing trivy..."
             wget -q https://github.com/aquasecurity/trivy/releases/download/v0.49.1/trivy_0.49.1_Linux-64bit.deb
             sudo dpkg -i trivy_0.49.1_Linux-64bit.deb
+            rm -f trivy_0.49.1_Linux-64bit.deb
           fi
+          trivy --version
 
       - name: Trivy filesystem scan
         run: |
-          trivy fs --scanners vuln,secret,misconfig --format json \
-            --output trivy-fs.json . || true
+          set -euo pipefail
+          trivy fs --scanners vuln,secret,misconfig \
+            --format json --output trivy-fs.json --exit-code 0 .
+          test -s trivy-fs.json
 
+      # Builds from the unmodified upstream Dockerfile. The previous branch
+      # rewrote it in a way that omitted index.js, so the image built but the
+      # container exited immediately and every downstream DAST result was void.
       - name: Build Docker image
-        run: docker build -t $IMAGE_NAME:$IMAGE_TAG .
+        run: |
+          set -euo pipefail
+          docker build \
+            --build-arg TARGETPLATFORM=linux/amd64 \
+            -t "$IMAGE_NAME:$IMAGE_TAG" .
+
+      - name: Smoke test the built image
+        run: |
+          set -euo pipefail
+          docker run --rm --entrypoint node "$IMAGE_NAME:$IMAGE_TAG" \
+            -e "require('fs').accessSync('/app/index.js'); console.log('index.js present')"
 
       - name: Trivy image scan
         run: |
-          trivy image --severity HIGH,CRITICAL --format json \
-            --output trivy-image.json $IMAGE_NAME:$IMAGE_TAG || true
+          set -euo pipefail
+          trivy image --severity HIGH,CRITICAL \
+            --format json --output trivy-image.json --exit-code 0 \
+            "$IMAGE_NAME:$IMAGE_TAG"
+          test -s trivy-image.json
+
+      - name: Summarize SCA findings
+        id: summarize
+        run: |
+          set -euo pipefail
+          NPM_CRIT=$(jq '.metadata.vulnerabilities.critical // 0' npm-audit.json)
+          NPM_HIGH=$(jq '.metadata.vulnerabilities.high // 0' npm-audit.json)
+          IMG=$(jq '[.Results[]?.Vulnerabilities[]?] | length' trivy-image.json)
+
+          echo "npm_critical=$NPM_CRIT"  >> "$GITHUB_OUTPUT"
+          echo "npm_high=$NPM_HIGH"      >> "$GITHUB_OUTPUT"
+          echo "image_highcrit=$IMG"     >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Dependency & image scanning"
+            echo ""
+            echo "| Scanner | Findings |"
+            echo "|---|---:|"
+            echo "| npm audit (critical) | $NPM_CRIT |"
+            echo "| npm audit (high) | $NPM_HIGH |"
+            echo "| Trivy image (HIGH+CRITICAL) | $IMG |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload SCA artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: sca-reports
@@ -142,33 +264,111 @@ jobs:
             npm-audit.json
             trivy-fs.json
             trivy-image.json
-          if-no-files-found: ignore
+          if-no-files-found: error
 
+  # ---------------------------------------------------------------------------
+  # 3. Dynamic and API security testing
+  # ---------------------------------------------------------------------------
+  # No continue-on-error. A DAST job that cannot reach its target must fail,
+  # otherwise a green tick is reported for a scan that tested nothing.
   dast-api-tests:
     name: Dynamic/API Security Testing (DAST)
     runs-on: self-hosted
     needs: dependency-scan
-    continue-on-error: true  # ✅ Prevents pipeline failure if DAST has issues
+    outputs:
+      zap_alerts: ${{ steps.summarize.outputs.zap_alerts }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Start app
-        run: |
-          docker rm -f abs-ci-test || true
-          docker run -d --name abs-ci-test -p 18080:80 $IMAGE_NAME:$IMAGE_TAG
-          sleep 15
+      - name: Create scan network
+        run: docker network create "$ZAP_NETWORK" || true
 
-      # ✅ FIX: Use Docker Hub image instead of GHCR
+      # Waits for a real 200 from /healthcheck rather than a blind sleep, and
+      # dumps container logs then fails if the app never comes up.
+      - name: Start application under test
+        run: |
+          set -euo pipefail
+          docker rm -f "$APP_CONTAINER" || true
+          docker run -d --name "$APP_CONTAINER" \
+            --network "$ZAP_NETWORK" \
+            -p 18080:80 \
+            "$IMAGE_NAME:$IMAGE_TAG"
+
+          echo "Waiting for application to become healthy..."
+          for i in $(seq 1 45); do
+            if curl -sf http://localhost:18080/healthcheck > /dev/null 2>&1; then
+              echo "Application responded on attempt $i"
+              exit 0
+            fi
+            sleep 2
+          done
+
+          echo "::error::Application did not become healthy within 90s"
+          docker logs "$APP_CONTAINER" || true
+          exit 1
+
+      # ZAP runs inside a container, so `localhost` there is ZAP itself, not the
+      # runner. Both containers now share $ZAP_NETWORK and ZAP targets the app
+      # by container name. The report is written to a mounted volume so it can
+      # be uploaded as evidence.
       - name: OWASP ZAP baseline scan
-        uses: docker://zaproxy/zap-stable:latest
+        run: |
+          set -uo pipefail
+          mkdir -p zap-out
+          chmod 777 zap-out
+          docker run --rm \
+            --network "$ZAP_NETWORK" \
+            -v "$PWD/zap-out:/zap/wrk:rw" \
+            -u root \
+            zaproxy/zap-stable:latest \
+            zap-baseline.py \
+              -t "http://${APP_CONTAINER}:80" \
+              -r zap-baseline-report.html \
+              -J zap-baseline-report.json \
+              -a -m 3 -T 5 || ZAP_EXIT=$?
+          echo "zap-baseline.py exit code: ${ZAP_EXIT:-0}"
+          # 0 = no alerts, 2 = warnings present (normal). 1 and 3 are failures.
+          if [ "${ZAP_EXIT:-0}" = "1" ] || [ "${ZAP_EXIT:-0}" = "3" ]; then
+            echo "::error::ZAP failed to complete the scan"
+            exit 1
+          fi
+
+      - name: Verify ZAP produced a report
+        run: |
+          set -euo pipefail
+          ls -la zap-out
+          test -s zap-out/zap-baseline-report.json
+          test -s zap-out/zap-baseline-report.html
+
+      - name: Summarize ZAP findings
+        id: summarize
+        run: |
+          set -euo pipefail
+          ALERTS=$(jq '[.site[]?.alerts[]?] | length' zap-out/zap-baseline-report.json)
+          echo "zap_alerts=$ALERTS" >> "$GITHUB_OUTPUT"
+          {
+            echo "### DAST (OWASP ZAP baseline)"
+            echo ""
+            echo "Alerts raised: **$ALERTS**"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload DAST artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          args: zap-baseline.py -t http://localhost:18080 -r /home/pawan/report.html
-        continue-on-error: true
+          name: dast-reports
+          path: zap-out/
+          if-no-files-found: error
 
       - name: Tear down test instance
         if: always()
-        run: docker rm -f abs-ci-test || true
+        run: |
+          docker rm -f "$APP_CONTAINER" || true
+          docker network rm "$ZAP_NETWORK" || true
 
+  # ---------------------------------------------------------------------------
+  # 4. Developer notification
+  # ---------------------------------------------------------------------------
   notify:
     name: Developer Notification
     runs-on: self-hosted
@@ -180,40 +380,128 @@ jobs:
         with:
           path: artifacts
 
-      - name: Notify on findings
-        if: needs.static-analysis.outputs.findings != '0'
+      - name: Aggregate findings
+        id: totals
         run: |
-          echo "⚠️ Security pipeline run #${{ github.run_number }} found ${{ needs.static-analysis.outputs.findings }} SAST findings."
-          echo "See: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          set -euo pipefail
+          SEMGREP="${{ needs.static-analysis.outputs.semgrep_findings || 0 }}"
+          ESLINT="${{ needs.static-analysis.outputs.eslint_findings || 0 }}"
+          GITLEAKS="${{ needs.static-analysis.outputs.gitleaks_findings || 0 }}"
+          NPM_CRIT="${{ needs.dependency-scan.outputs.npm_critical || 0 }}"
+          NPM_HIGH="${{ needs.dependency-scan.outputs.npm_high || 0 }}"
+          IMG="${{ needs.dependency-scan.outputs.image_highcrit || 0 }}"
+          ZAP="${{ needs.dast-api-tests.outputs.zap_alerts || 0 }}"
 
+          TOTAL=$((SEMGREP + ESLINT + GITLEAKS + NPM_CRIT + NPM_HIGH + IMG + ZAP))
+          echo "total=$TOTAL" >> "$GITHUB_OUTPUT"
+          {
+            echo "semgrep=$SEMGREP"
+            echo "eslint=$ESLINT"
+            echo "gitleaks=$GITLEAKS"
+            echo "npm_crit=$NPM_CRIT"
+            echo "npm_high=$NPM_HIGH"
+            echo "image=$IMG"
+            echo "zap=$ZAP"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Total findings across all stages: $TOTAL"
+
+      # The issue body deliberately contains more than three Markdown headings.
+      # The repository inherits upstream's close_blank_issues.yaml, which closes
+      # any issue with fewer than three headings; the previous single-line body
+      # meant every automated notification was auto-closed within seconds.
       - name: Open GitHub Issue
-        if: needs.static-analysis.outputs.findings != '0'
+        if: steps.totals.outputs.total != '0'
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.PAT_TOKEN }}
           script: |
+            const t = ${{ toJSON(steps.totals.outputs) }};
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+
+            const body = [
+              '## Summary',
+              '',
+              `Automated DevSecOps pipeline run **#${context.runNumber}** reported **${t.total}** finding(s) on commit \`${context.sha.substring(0,7)}\`.`,
+              '',
+              '## Findings by stage',
+              '',
+              '| Stage | Tool | Findings |',
+              '|---|---|---:|',
+              `| SAST | Semgrep | ${t.semgrep} |`,
+              `| SAST | ESLint (security) | ${t.eslint} |`,
+              `| SAST | Gitleaks | ${t.gitleaks} |`,
+              `| SCA | npm audit (critical) | ${t.npm_crit} |`,
+              `| SCA | npm audit (high) | ${t.npm_high} |`,
+              `| SCA | Trivy image (HIGH+CRITICAL) | ${t.image} |`,
+              `| DAST | OWASP ZAP baseline | ${t.zap} |`,
+              '',
+              '## Evidence',
+              '',
+              `Full logs and downloadable reports: ${runUrl}`,
+              '',
+              'Artifacts: `sast-reports`, `sca-reports`, `dast-reports`.',
+              '',
+              '## Triage guidance',
+              '',
+              'CRITICAL/HIGH should be actioned same day. See `MAINTENANCE.md` section 3 for how to read each report format.'
+            ].join('\n');
+
             const issue = await github.rest.issues.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              title: `Security pipeline findings — run #${context.runNumber}`,
-              body: `Automated pipeline detected potential issues. See run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              title: `Security pipeline findings - run #${context.runNumber}`,
+              body,
               labels: ['security', 'automated']
             });
-            console.log(`Created issue #${issue.data.number}`);
+            core.info(`Created issue #${issue.data.number}`);
+            core.summary.addLink('Notification issue', issue.data.html_url);
+            await core.summary.write();
 
+      - name: Report clean run
+        if: steps.totals.outputs.total == '0'
+        run: echo "No findings across any stage. No notification issue opened."
+
+  # ---------------------------------------------------------------------------
+  # 5. Automated secure deployment (Part 2)
+  # ---------------------------------------------------------------------------
+  # Failures are no longer swallowed by `|| echo`. If Ansible or the validation
+  # script fails, this job fails, because a passing deploy job that deployed
+  # nothing is worse than no deploy job at all.
   deploy:
     name: Automated Secure Deployment
     runs-on: self-hosted
     needs: [ static-analysis, dependency-scan, dast-api-tests ]
-    if: success()
+    if: success() && github.event_name != 'pull_request'
     steps:
       - uses: actions/checkout@v4
 
-      - name: Deploy via Ansible
+      - name: Verify deployment prerequisites
         run: |
-          ansible-playbook -i ansible/inventory.ini ansible/deploy.yml || echo "Ansible not configured"
+          set -euo pipefail
+          command -v ansible-playbook
+          test -f ansible/inventory.ini
+          test -f ansible/deploy.yml
+          test -f docker/docker-compose.hardened.yml
+          test -f docker/Caddyfile
+          test -f scripts/post-deploy-validate.sh
+
+      - name: Deploy via Ansible
+        run: ansible-playbook -i ansible/inventory.ini ansible/deploy.yml
 
       - name: Post-deployment validation
         run: |
-          chmod +x scripts/post-deploy-validate.sh 2>/dev/null || true
-          ./scripts/post-deploy-validate.sh 2>/dev/null || echo "Validation skipped"
+          set -euo pipefail
+          chmod +x scripts/post-deploy-validate.sh
+          ./scripts/post-deploy-validate.sh | tee post-deploy-validation.log
+
+      - name: Upload deployment validation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-validation
+          path: |
+            post-deploy-validation.log
+            trivy-post-deploy.txt
+            nmap-post-deploy.txt
+          if-no-files-found: warn

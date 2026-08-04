@@ -1,23 +1,34 @@
 ---
-- name: Automated secure deployment of Audiobookshelf (Part 2)
+# Automated secure deployment of Audiobookshelf (Project Part 2)
+#
+# Changed from the previous version: the `vars_files: [secrets.yml]` declaration
+# was removed. That file was never committed, so the playbook aborted before its
+# first task on every pipeline run, and the workflow's `|| echo "Ansible not
+# configured"` fallback converted the abort into a passing step. No variable in
+# this playbook was ever sourced from it.
+#
+# If secrets are needed later, create ansible/secrets.yml with
+# `ansible-vault create`, commit the encrypted file, and re-add vars_files.
+
+- name: Automated secure deployment of Audiobookshelf
   hosts: local
   become: true
-  vars_files:
-    - secrets.yml   # created via `ansible-vault create ansible/secrets.yml` — do not commit plaintext
+
+  vars:
+    deploy_dir: /opt/abs-hardened
+    data_root: /home/ubuntu/abs-hardened-data
+    app_container: abs-hardened
+    proxy_container: abs-caddy
 
   tasks:
-    - name: Ensure OS packages are up to date
-      apt:
-        update_cache: yes
-        upgrade: dist
-      when: ansible_os_family == "Debian"
-
-    - name: Ensure Docker is installed
+    - name: Ensure required OS packages are present
       apt:
         name:
           - docker.io
           - docker-compose-plugin
         state: present
+        update_cache: yes
+      when: ansible_os_family == "Debian"
 
     - name: Ensure Docker service is running
       service:
@@ -27,20 +38,20 @@
 
     - name: Create deployment directory
       file:
-        path: /opt/abs-hardened
+        path: "{{ deploy_dir }}"
         state: directory
         mode: "0750"
 
     - name: Copy hardened compose file
       copy:
         src: ../docker/docker-compose.hardened.yml
-        dest: /opt/abs-hardened/docker-compose.yml
+        dest: "{{ deploy_dir }}/docker-compose.yml"
         mode: "0640"
 
     - name: Copy Caddy config (HTTPS + secure headers)
       copy:
         src: ../docker/Caddyfile
-        dest: /opt/abs-hardened/Caddyfile
+        dest: "{{ deploy_dir }}/Caddyfile"
         mode: "0640"
 
     - name: Ensure data directories exist with correct ownership
@@ -51,26 +62,48 @@
         group: "1000"
         mode: "0750"
       loop:
-        - /home/pawan/audiobookshelf/config
-        - /home/pawan/audiobookshelf/metadata
+        - "{{ data_root }}/config"
+        - "{{ data_root }}/metadata"
+        - "{{ data_root }}/audiobooks"
+        - "{{ data_root }}/podcasts"
 
-    - name: Pull latest images
-      command: docker compose -f /opt/abs-hardened/docker-compose.yml pull
+    - name: Pull pinned images
+      command: docker compose -f {{ deploy_dir }}/docker-compose.yml pull
+      register: pull_result
+      changed_when: "'Pulled' in pull_result.stderr or 'Downloaded' in pull_result.stderr"
 
     - name: Deploy hardened stack
-      command: docker compose -f /opt/abs-hardened/docker-compose.yml up -d
+      command: docker compose -f {{ deploy_dir }}/docker-compose.yml up -d
+      register: up_result
+      changed_when: "'Started' in up_result.stderr or 'Created' in up_result.stderr"
 
-    - name: Wait for healthcheck to pass
-      shell: docker inspect --format='{{"{{"}}.State.Health.Status{{"}}"}}' abs-hardened
+    - name: Wait for application healthcheck to pass
+      shell: |
+        {% raw %}docker inspect --format '{{ .State.Health.Status }}'{% endraw %} {{ app_container }}
       register: health
-      until: health.stdout == "healthy"
-      retries: 10
+      until: health.stdout | trim == "healthy"
+      retries: 20
       delay: 5
+      changed_when: false
+
+    - name: Confirm reverse proxy is running
+      shell: |
+        {% raw %}docker inspect --format '{{ .State.Running }}'{% endraw %} {{ proxy_container }}
+      register: proxy_state
+      failed_when: proxy_state.stdout | trim != "true"
+      changed_when: false
 
     - name: Verify network access controls (only expected ports exposed)
-      command: docker port abs-caddy
+      command: docker port {{ proxy_container }}
       register: ports_out
+      changed_when: false
 
-    - name: Show exposed ports (for audit trail / screenshot evidence)
+    - name: Confirm the application container publishes no host ports directly
+      command: docker port {{ app_container }}
+      register: app_ports
+      failed_when: app_ports.stdout | trim | length > 0
+      changed_when: false
+
+    - name: Show exposed ports (audit trail / screenshot evidence)
       debug:
         var: ports_out.stdout_lines

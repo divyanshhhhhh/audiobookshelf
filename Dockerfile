@@ -5,15 +5,15 @@ ARG NUSQLITE3_PATH="${NUSQLITE3_DIR}/libnusqlite3.so"
 FROM node:20-alpine AS build-client
 
 WORKDIR /client
-COPY client/package*.json /client/
+COPY /client /client
 RUN npm ci && npm cache clean --force
-COPY client/ /client/
 RUN npm run generate
 
 ### STAGE 1: Build server ###
 FROM node:20-alpine AS build-server
 
 ARG NUSQLITE3_DIR
+ARG TARGETPLATFORM
 
 ENV NODE_ENV=production
 
@@ -25,15 +25,16 @@ RUN apk add --no-cache --update \
   unzip
 
 WORKDIR /server
+COPY index.js package* /server
+COPY /server /server/server
 
-# Copy package.json from root
-COPY package*.json /server/
-
-# Copy all server code
-COPY server/ /server/
-
-# Download nusqlite3 library (x64 only - works on most systems)
-RUN curl -L -o /tmp/library.zip "https://github.com/mikiher/nunicode-sqlite/releases/download/v1.2/libnusqlite3-linux-musl-x64.zip" && \
+RUN case "$TARGETPLATFORM" in \
+  "linux/amd64") \
+  curl -L -o /tmp/library.zip "https://github.com/mikiher/nunicode-sqlite/releases/download/v1.2/libnusqlite3-linux-musl-x64.zip" ;; \
+  "linux/arm64") \
+  curl -L -o /tmp/library.zip "https://github.com/mikiher/nunicode-sqlite/releases/download/v1.2/libnusqlite3-linux-musl-arm64.zip" ;; \
+  *) echo "Unsupported platform: $TARGETPLATFORM" && exit 1 ;; \
+  esac && \
   unzip /tmp/library.zip -d $NUSQLITE3_DIR && \
   rm /tmp/library.zip
 
@@ -45,6 +46,7 @@ FROM node:20-alpine
 ARG NUSQLITE3_DIR
 ARG NUSQLITE3_PATH
 
+# Install only runtime dependencies
 RUN apk add --no-cache --update \
   tzdata \
   ffmpeg \
