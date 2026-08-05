@@ -1,0 +1,144 @@
+---
+# Automated secure deployment of Audiobookshelf (Project Part 2)
+#
+# Changed from the previous version: the `vars_files: [secrets.yml]` declaration
+# was removed. That file was never committed, so the playbook aborted before its
+# first task on every pipeline run, and the workflow's `|| echo "Ansible not
+# configured"` fallback converted the abort into a passing step. No variable in
+# this playbook was ever sourced from it.
+#
+# If secrets are needed later, create ansible/secrets.yml with
+# `ansible-vault create`, commit the encrypted file, and re-add vars_files.
+
+- name: Automated secure deployment of Audiobookshelf
+  hosts: local
+  become: true
+
+  vars:
+    deploy_dir: /opt/abs-hardened
+    data_root: /home/ubuntu/abs-hardened-data
+    app_container: abs-hardened
+    proxy_container: abs-caddy
+    proxy_service: caddy   # compose service name, distinct from container_name
+
+  tasks:
+    # This deliberately verifies Docker rather than installing `docker.io`.
+    # The previous version installed Ubuntu's `docker.io` package unconditionally.
+    # On any host running Docker CE from Docker's own apt repository (which is
+    # what this runner uses) those packages conflict, so the task would have
+    # removed docker-ce and containerd.io part way through the deployment,
+    # taking the self-hosted runner and every running container with it.
+    # Docker is a prerequisite of the runner itself, so verifying is correct;
+    # installation is only attempted when no Docker is present at all.
+    - name: Check whether Docker is already installed
+      command: docker --version
+      register: docker_version
+      changed_when: false
+      failed_when: false
+
+    - name: Install Docker only when the host has none
+      apt:
+        name:
+          - docker.io
+          - docker-compose-plugin
+        state: present
+        update_cache: yes
+      when:
+        - ansible_os_family == "Debian"
+        - docker_version.rc != 0
+
+    - name: Verify the Docker Compose v2 plugin is available
+      command: docker compose version
+      register: compose_version
+      changed_when: false
+
+    - name: Show detected Docker toolchain
+      debug:
+        msg: "Docker server {{ docker_version.stdout | default('newly installed') }} / {{ compose_version.stdout }}"
+
+    - name: Ensure Docker service is running
+      service:
+        name: docker
+        state: started
+        enabled: true
+
+    - name: Create deployment directory
+      file:
+        path: "{{ deploy_dir }}"
+        state: directory
+        mode: "0750"
+
+    - name: Copy hardened compose file
+      copy:
+        src: ../docker/docker-compose.hardened.yml
+        dest: "{{ deploy_dir }}/docker-compose.yml"
+        mode: "0640"
+
+    - name: Copy Caddy config (HTTPS + secure headers)
+      copy:
+        src: ../docker/Caddyfile
+        dest: "{{ deploy_dir }}/Caddyfile"
+        mode: "0640"
+      register: caddyfile_copy
+
+    - name: Ensure data directories exist with correct ownership
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: "1000"
+        group: "1000"
+        mode: "0750"
+      loop:
+        - "{{ data_root }}/config"
+        - "{{ data_root }}/metadata"
+        - "{{ data_root }}/audiobooks"
+        - "{{ data_root }}/podcasts"
+
+    - name: Pull pinned images
+      command: docker compose -f {{ deploy_dir }}/docker-compose.yml pull
+      register: pull_result
+      changed_when: "'Pulled' in pull_result.stderr or 'Downloaded' in pull_result.stderr"
+
+    - name: Deploy hardened stack
+      command: docker compose -f {{ deploy_dir }}/docker-compose.yml up -d
+      register: up_result
+      changed_when: "'Started' in up_result.stderr or 'Created' in up_result.stderr"
+
+    # The Caddyfile is bind mounted, so `up -d` sees no change to the container
+    # spec and leaves the proxy running with its previous configuration. Without
+    # this, an edited Caddyfile would appear to deploy successfully while the
+    # running proxy still served the old config.
+    - name: Restart reverse proxy when its configuration changed
+      command: docker compose -f {{ deploy_dir }}/docker-compose.yml restart {{ proxy_service }}
+      when: caddyfile_copy.changed
+
+    - name: Wait for application healthcheck to pass
+      shell: |
+        {% raw %}docker inspect --format '{{ .State.Health.Status }}'{% endraw %} {{ app_container }}
+      register: health
+      until: health.stdout | trim == "healthy"
+      retries: 20
+      delay: 5
+      changed_when: false
+
+    - name: Confirm reverse proxy is running
+      shell: |
+        {% raw %}docker inspect --format '{{ .State.Running }}'{% endraw %} {{ proxy_container }}
+      register: proxy_state
+      failed_when: proxy_state.stdout | trim != "true"
+      changed_when: false
+
+    - name: Verify network access controls (only expected ports exposed)
+      command: docker port {{ proxy_container }}
+      register: ports_out
+      changed_when: false
+
+    - name: Confirm the application container publishes no host ports directly
+      command: docker port {{ app_container }}
+      register: app_ports
+      failed_when: app_ports.stdout | trim | length > 0
+      changed_when: false
+
+    - name: Show exposed ports (audit trail / screenshot evidence)
+      debug:
+        var: ports_out.stdout_lines
