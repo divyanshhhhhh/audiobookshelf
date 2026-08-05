@@ -24,3 +24,10 @@ sw.*
 .idea/*
 tailwind.compiled.css
 tailwind.config.js
+
+# Security test scratch output
+/security-tests-results.json
+/sectest-config/
+/sectest-metadata/
+/sectest-media/
+/server.log

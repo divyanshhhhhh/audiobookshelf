@@ -1,0 +1,113 @@
+name: Security Tests
+
+# Application-specific security regression tests. See SECURITY_TEST_CASES.md
+# for what each test checks and why.
+#
+# This intentionally does not build the client. The tests exercise server API
+# routes only, and the server starts and serves those routes without
+# client/dist present, so the job avoids the expensive Nuxt build.
+on:
+  pull_request:
+  push:
+    branches: [ master ]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  security-tests:
+    name: Security test cases
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: get server dependencies
+        run: npm ci --only=production
+
+      # The server installs its own ffmpeg into the application root on first
+      # start, which the test script then reuses, so no system ffmpeg or extra
+      # package installation is needed.
+      - name: start audiobookshelf
+        env:
+          PORT: 3333
+          CONFIG_PATH: ${{ github.workspace }}/sectest-config
+          METADATA_PATH: ${{ github.workspace }}/sectest-metadata
+          # The rate limiter's window and threshold are lowered through the
+          # environment variables the application already supports, so ST-01
+          # completes in seconds instead of exhausting 40 attempts over ten
+          # minutes. This changes the limiter's configuration only; the code
+          # path under test is the same one used in production.
+          RATE_LIMIT_AUTH_MAX: 5
+          RATE_LIMIT_AUTH_WINDOW: 60000
+        run: |
+          mkdir -p "$CONFIG_PATH" "$METADATA_PATH"
+          node index.js > server.log 2>&1 &
+          echo "$!" > server.pid
+          for i in $(seq 1 60); do
+            if curl -sf http://127.0.0.1:3333/healthcheck > /dev/null 2>&1; then
+              echo "server is up after $i attempts"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::server did not become healthy"
+          cat server.log
+          exit 1
+
+      - name: run security tests
+        env:
+          SECTEST_MEDIA_ROOT: ${{ github.workspace }}/sectest-media
+        run: ./scripts/security-tests.sh http://127.0.0.1:3333
+
+      - name: summarise results
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ ! -s security-tests-results.json ]; then
+            echo "::error::security-tests-results.json was not produced"
+            exit 1
+          fi
+          PASSES=$(jq -r '.summary.pass'  security-tests-results.json)
+          FAILS=$(jq -r '.summary.fail'   security-tests-results.json)
+          ERRORS=$(jq -r '.summary.error' security-tests-results.json)
+          REG=$(jq -r --slurpfile b security-tests-baseline.json \
+            '[.results[] | select(.status=="fail") | .id as $id
+              | select(($b[0].known_failing | has($id)) | not) | $id] | length' \
+            security-tests-results.json)
+          {
+            echo "### Security test cases"
+            echo ""
+            echo "Passed: **$PASSES**  Failed: **$FAILS**  Errored: **$ERRORS**  Regressions: **$REG**"
+            echo ""
+            echo "| ID | Test | WSTG | Severity | Status |"
+            echo "|---|---|---|---|---|"
+            jq -r '.results[] | "| \(.id) | \(.title) | \(.wstg) | \(.severity) | \(.status) |"' \
+              security-tests-results.json
+            echo ""
+            echo "Failures listed in \`security-tests-baseline.json\` are known and do not fail the build. See \`SECURITY_TEST_CASES.md\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-test-results
+          path: |
+            security-tests-results.json
+            security-tests-baseline.json
+            server.log
+          if-no-files-found: warn
+
+      - name: stop audiobookshelf
+        if: always()
+        run: |
+          if [ -f server.pid ]; then
+            kill "$(cat server.pid)" 2>/dev/null || true
+          fi

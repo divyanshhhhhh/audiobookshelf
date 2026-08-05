@@ -1,0 +1,20 @@
+{
+  "_comment": [
+    "Tests listed here assert behaviour the application does not currently exhibit, so they",
+    "are expected to fail. The security-tests workflow reports them as failures and counts",
+    "them, but does not break the build for them, because they are already known.",
+    "",
+    "A failing test that is NOT listed here is a regression and fails the build.",
+    "A test that starts passing should be removed from this file in the same commit as the",
+    "fix, so that any later regression is caught.",
+    "",
+    "Tested against Audiobookshelf 2.36.0."
+  ],
+  "known_failing": {
+    "ST-01": "The login rate limiter keys on requestIp.getClientIp(), which reads client-supplied forwarding headers before the socket address, so varying X-Forwarded-For per request avoids the threshold entirely. A fix would trust the proxy chain explicitly rather than any header the client can set.",
+    "ST-02": "Logout invalidates the refresh token and clears its cookie, but performs no revocation of the already-issued bearer access token, which stays valid until it expires. A fix would need server-side invalidation of outstanding access tokens.",
+    "ST-04": "A user holding only the upload permission can store a .html file, and GET /api/items/:id/file/:ino serves it inline as text/html in the application origin. The sibling /download route already sets an attachment disposition, so a fix could apply the same treatment to non-media library files.",
+    "ST-05": "The /api/me/progress routes bind directly to MeController without LibraryItemController.middleware, so they do not apply the library access check that the rest of the item API applies.",
+    "ST-06": "GET /api/items/:id/cover is registered without LibraryItemController.middleware, unlike the POST, PATCH and DELETE handlers on the same path, so cover art is readable without a session."
+  }
+}
