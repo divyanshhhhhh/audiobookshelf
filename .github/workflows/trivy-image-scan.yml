@@ -1,0 +1,61 @@
+name: Trivy Image Scan
+
+# Builds the image from the repository Dockerfile and scans it for HIGH and
+# CRITICAL vulnerabilities, then uploads the results to GitHub code scanning so
+# they appear in the Security tab alongside the existing CodeQL results.
+#
+# This is reporting, not gating: --exit-code 0 means a newly published CVE in a
+# base image layer does not fail an unrelated pull request. The findings are
+# still visible, and are the sort of thing worth checking before a release.
+#
+# Unlike the security tests workflow, this does build the client, because it
+# builds the real image. It is therefore the slowest of these workflows, which
+# is why it is scheduled and manual rather than running on every push.
+on:
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch: {}
+  pull_request:
+    paths:
+      - Dockerfile
+      - package-lock.json
+      - client/package-lock.json
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  trivy-image-scan:
+    name: Build and scan the image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build image
+        run: docker build -t audiobookshelf:scan-target .
+
+      - name: scan image
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: audiobookshelf:scan-target
+          format: sarif
+          output: trivy-image.sarif
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: '0'
+
+      - name: upload results to code scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-image.sarif
+          category: trivy-image
+
+      - name: upload raw report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-image-report
+          path: trivy-image.sarif
+          if-no-files-found: warn
