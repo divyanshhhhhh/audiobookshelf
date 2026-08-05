@@ -7,6 +7,13 @@
 # redirects to the correct external port instead.
 {
 	auto_https disable_redirects
+
+	# A client connecting to a bare IP address sends no SNI, so Caddy has no
+	# name with which to select a certificate and aborts the handshake. Naming
+	# the lab LAN address as the default makes browsers that reach this host by
+	# IP receive a matching certificate. The issuing CA is still untrusted,
+	# which is inherent to `tls internal` and expected in this lab.
+	default_sni 192.168.204.191
 }
 
 :80 {
@@ -18,7 +25,12 @@
 # an internal error and the deployment served no HTTPS at all.
 # `bind 0.0.0.0` is required because naming a host would otherwise bind only the
 # loopback interface inside the container, which the published port cannot reach.
-https://localhost, https://127.0.0.1 {
+# Site addresses include the lab VM's hostname and LAN addresses. With only
+# `localhost` listed, a browser on another machine requesting https://<vm-ip>
+# sent an SNI that matched no site block, so the connection was refused before
+# any header could be inspected. `tls internal` issues for IP SANs as well.
+# Add the real hostname here when deploying somewhere other than this lab.
+https://localhost, https://127.0.0.1, https://ubuntu2404, https://192.168.204.191, https://192.168.40.20 {
 	bind 0.0.0.0
 
 	tls internal   # swap for a real cert (Let's Encrypt) once you have a public domain
@@ -37,10 +49,34 @@ https://localhost, https://127.0.0.1 {
 	# Restrict access to admin/config endpoints to local network only
 	@adminPaths path /config* /api/settings*
 	handle @adminPaths {
-		# All three RFC1918 ranges plus loopback. 172.16.0.0/12 was missing, which
-		# matters because Docker bridge networks live in that range, so traffic
-		# arriving through the proxy was treated as external.
-		@notLocal not remote_ip 192.168.0.0/16 10.0.0.0/8 172.16.0.0/12 127.0.0.1/8
+		# Restricted to the host itself, deliberately NOT to all of RFC1918.
+		#
+		# Measured behaviour of this deployment before changing it:
+		#   - a request to 127.0.0.1:13443 reaches Caddy as 172.17.0.1, because
+		#     Docker's userland proxy rewrites the source of loopback traffic to
+		#     the bridge gateway. 172.16.0.0/12 is therefore required for the
+		#     host's own requests to be recognised as local.
+		#   - a request from any other address keeps its real source IP: sending
+		#     from 192.168.40.20 to 192.168.204.191 arrives as 192.168.40.20.
+		#     External client IPs are preserved, not rewritten.
+		#
+		# The earlier allowlist covered 192.168.0.0/16 and 10.0.0.0/8. Because
+		# this lab's other machines sit on 192.168.204.0/24, every host on the
+		# lab network was treated as local and the restriction admitted exactly
+		# the attacker it was supposed to exclude. Widening the allowlist further
+		# would have made that worse. Narrowing it to the host means the admin
+		# paths are reachable from the VM itself and from containers on the box,
+		# and answer 403 to every other machine.
+		#
+		# Operators deploying this elsewhere should replace 172.16.0.0/12 with
+		# their own management subnet rather than re-adding whole RFC1918 ranges.
+		#
+		# Note this matcher is `remote_ip`, which reads the peer address of the
+		# TCP connection. It is not `client_ip`, which would consult
+		# X-Forwarded-For and would be spoofable by any client. That distinction
+		# is the difference between this control and group finding V-05, where
+		# the rate limiter keys off an attacker-supplied header.
+		@notLocal not remote_ip 127.0.0.1/8 172.16.0.0/12
 		respond @notLocal 403
 		reverse_proxy audiobookshelf:80
 	}

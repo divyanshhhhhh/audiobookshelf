@@ -19,6 +19,10 @@ env:
   IMAGE_TAG: ci-${{ github.run_number }}
   ZAP_NETWORK: abs-ci-net
   APP_CONTAINER: abs-ci-test
+  # The security tests get their own container, port and network so they never
+  # touch the hardened deployment or the lab evidence containers on this host.
+  SECTEST_NETWORK: abs-sectest-net
+  SECTEST_CONTAINER: abs-sectest
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -375,12 +379,122 @@ jobs:
           docker network rm "$ZAP_NETWORK" || true
 
   # ---------------------------------------------------------------------------
-  # 4. Developer notification
+  # 4. Application-specific security regression tests
+  # ---------------------------------------------------------------------------
+  # ZAP's baseline scan is generic: it finds missing headers and similar classes
+  # of issue, but it cannot know that this application's media-progress endpoint
+  # skips a library authorization check. These tests encode the findings the
+  # group produced in Labs 2 to 5 so that each one is re-checked on every commit.
+  #
+  # Several of the tested vulnerabilities are unpatched, so their tests fail.
+  # Those failures are recorded in security-tests-baseline.json and are reported
+  # rather than hidden: counts appear in the step summary, in the uploaded
+  # artifact and in the notification issue. The job fails on a regression (a
+  # failure not in the baseline) or on an error (the harness could not run).
+  # See SECURITY_TEST_CASES.md for the justification behind each test.
+  security-tests:
+    name: Application Security Test Cases
+    runs-on: self-hosted
+    needs: dependency-scan
+    outputs:
+      security_test_failures: ${{ steps.summarize.outputs.security_test_failures }}
+      security_test_regressions: ${{ steps.summarize.outputs.security_test_regressions }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create test network
+        run: docker network create "$SECTEST_NETWORK" || true
+
+      # The rate limiter's window and threshold are tuned down through the
+      # environment variables the application already supports, so ST-01 runs in
+      # seconds instead of grinding through 40 attempts over ten minutes. This
+      # changes the limiter's configuration, never its logic: the code path
+      # under test is identical to production.
+      - name: Start ephemeral test instance
+        run: |
+          set -euo pipefail
+          docker rm -f "$SECTEST_CONTAINER" || true
+          docker run -d --name "$SECTEST_CONTAINER" \
+            --network "$SECTEST_NETWORK" \
+            -p 18081:80 \
+            -e RATE_LIMIT_AUTH_MAX=5 \
+            -e RATE_LIMIT_AUTH_WINDOW=60000 \
+            "$IMAGE_NAME:$IMAGE_TAG"
+
+          echo "Waiting for the test instance to become healthy..."
+          for i in $(seq 1 45); do
+            if curl -sf http://localhost:18081/healthcheck > /dev/null 2>&1; then
+              echo "Test instance responded on attempt $i"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::Test instance did not become healthy within 90s"
+          docker logs "$SECTEST_CONTAINER" || true
+          exit 1
+
+      # SECTEST_CONTAINER comes from the workflow-level env block; the script
+      # uses it to reach the target's bundled ffmpeg when building fixtures.
+      - name: Run security test cases
+        run: ./scripts/security-tests.sh http://localhost:18081
+
+      - name: Summarize security test results
+        id: summarize
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ ! -s security-tests-results.json ]; then
+            echo "::error::security-tests-results.json was not produced"
+            exit 1
+          fi
+          FAILS=$(jq -r '.summary.fail' security-tests-results.json)
+          PASSES=$(jq -r '.summary.pass' security-tests-results.json)
+          ERRORS=$(jq -r '.summary.error' security-tests-results.json)
+          REG=$(jq -r --slurpfile b security-tests-baseline.json \
+            '[.results[] | select(.status=="fail") | .id as $id
+              | select(($b[0].known_failing | has($id)) | not) | $id] | length' \
+            security-tests-results.json)
+
+          echo "security_test_failures=$FAILS"    >> "$GITHUB_OUTPUT"
+          echo "security_test_regressions=$REG"   >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Application security test cases"
+            echo ""
+            echo "Passed: **$PASSES**  Failed: **$FAILS**  Errored: **$ERRORS**  Regressions: **$REG**"
+            echo ""
+            echo "| ID | Finding | Test | WSTG | Severity | Status |"
+            echo "|---|---|---|---|---|---|"
+            jq -r '.results[] | "| \(.id) | \(.finding) | \(.title) | \(.wstg) | \(.severity) | \(.status) |"' \
+              security-tests-results.json
+            echo ""
+            echo "Failures listed in \`security-tests-baseline.json\` are known unpatched findings, not regressions. See \`SECURITY_TEST_CASES.md\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload security test artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-test-reports
+          path: |
+            security-tests-results.json
+            security-tests-baseline.json
+          if-no-files-found: error
+
+      - name: Tear down test instance
+        if: always()
+        run: |
+          docker logs "$SECTEST_CONTAINER" > sectest-container.log 2>&1 || true
+          docker rm -f "$SECTEST_CONTAINER" || true
+          docker network rm "$SECTEST_NETWORK" || true
+
+  # ---------------------------------------------------------------------------
+  # 5. Developer notification
   # ---------------------------------------------------------------------------
   notify:
     name: Developer Notification
     runs-on: self-hosted
-    needs: [ static-analysis, dependency-scan, dast-api-tests ]
+    needs: [ static-analysis, dependency-scan, dast-api-tests, security-tests ]
     if: always()
     steps:
       - name: Download all reports
@@ -399,8 +513,10 @@ jobs:
           NPM_HIGH="${{ needs.dependency-scan.outputs.npm_high || 0 }}"
           IMG="${{ needs.dependency-scan.outputs.image_highcrit || 0 }}"
           ZAP="${{ needs.dast-api-tests.outputs.zap_alerts || 0 }}"
+          SECTEST="${{ needs.security-tests.outputs.security_test_failures || 0 }}"
+          SECTEST_REG="${{ needs.security-tests.outputs.security_test_regressions || 0 }}"
 
-          TOTAL=$((SEMGREP + ESLINT + GITLEAKS + NPM_CRIT + NPM_HIGH + IMG + ZAP))
+          TOTAL=$((SEMGREP + ESLINT + GITLEAKS + NPM_CRIT + NPM_HIGH + IMG + ZAP + SECTEST))
           echo "total=$TOTAL" >> "$GITHUB_OUTPUT"
           {
             echo "semgrep=$SEMGREP"
@@ -410,6 +526,8 @@ jobs:
             echo "npm_high=$NPM_HIGH"
             echo "image=$IMG"
             echo "zap=$ZAP"
+            echo "sectest=$SECTEST"
+            echo "sectest_reg=$SECTEST_REG"
           } >> "$GITHUB_OUTPUT"
 
           echo "Total findings across all stages: $TOTAL"
@@ -443,12 +561,16 @@ jobs:
               `| SCA | npm audit (high) | ${t.npm_high} |`,
               `| SCA | Trivy image (HIGH+CRITICAL) | ${t.image} |`,
               `| DAST | OWASP ZAP baseline | ${t.zap} |`,
+              `| Security test cases | Application-specific regression tests | ${t.sectest} |`,
+              '',
+              `Security test regressions (failures not covered by the committed baseline): **${t.sectest_reg}**.`,
+              'Baseline failures are known unpatched findings documented in `SECURITY_TEST_CASES.md`.',
               '',
               '## Evidence',
               '',
               `Full logs and downloadable reports: ${runUrl}`,
               '',
-              'Artifacts: `sast-reports`, `sca-reports`, `dast-reports`.',
+              'Artifacts: `sast-reports`, `sca-reports`, `dast-reports`, `security-test-reports`.',
               '',
               '## Triage guidance',
               '',
@@ -471,15 +593,18 @@ jobs:
         run: echo "No findings across any stage. No notification issue opened."
 
   # ---------------------------------------------------------------------------
-  # 5. Automated secure deployment (Part 2)
+  # 6. Automated secure deployment (Part 2)
   # ---------------------------------------------------------------------------
   # Failures are no longer swallowed by `|| echo`. If Ansible or the validation
   # script fails, this job fails, because a passing deploy job that deployed
   # nothing is worse than no deploy job at all.
+  #
+  # This also depends on security-tests, so a security regression blocks the
+  # deployment rather than merely being reported after it.
   deploy:
     name: Automated Secure Deployment
     runs-on: self-hosted
-    needs: [ static-analysis, dependency-scan, dast-api-tests ]
+    needs: [ static-analysis, dependency-scan, dast-api-tests, security-tests ]
     if: success() && github.event_name != 'pull_request'
     steps:
       - uses: actions/checkout@v4

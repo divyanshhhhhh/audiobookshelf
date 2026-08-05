@@ -1,0 +1,22 @@
+{
+  "_comment": [
+    "Tests listed here assert secure behaviour that this application does not yet exhibit.",
+    "They are expected to fail. The security-tests job reports them as failures, counts them,",
+    "and feeds them into the notification issue, but does not break the build for them,",
+    "because the underlying defects are already known and reported.",
+    "",
+    "A failing test that is NOT listed here is a regression and fails the build.",
+    "A test that starts passing should be removed from this file in the same commit as the fix,",
+    "so that any later regression is caught.",
+    "",
+    "Justifications cite the group's own vulnerability report IDs."
+  ],
+  "known_failing": {
+    "ST-01": "V-05: the authentication rate limiter keys on requestIp.getClientIp(), which trusts X-Forwarded-For, so an attacker rotating that header never reaches the threshold. Fixing this requires trusting the proxy chain explicitly rather than any client-supplied header.",
+    "ST-02": "V-04: logout invalidates the refresh token and clears its cookie but performs no revocation of the already-issued bearer access token, which stays valid until expiry. Fixing this requires server-side session or token invalidation.",
+    "ST-04": "V-01: a user holding only the upload permission can store an .html file, and GET /api/items/:id/file/:ino serves it inline as text/html in the application origin, producing stored XSS. Fixing this requires forcing a download disposition or a non-executable content type for non-media library files.",
+    "ST-05": "V-09: the media-progress endpoints do not apply the library access check that the rest of the item API applies, so a user can store and read progress against items in libraries they cannot see. Fixing this requires the same authorization middleware used by /api/items.",
+    "ST-06": "V-14: GET /api/items/:id/cover carries no authentication middleware, so cover art is readable without a session regardless of library visibility. Fixing this requires authenticating the route and checking library access.",
+    "ST-07": "New finding, not in the original report. MiscController.handleUpload passes a non-string to Path.join when two files share one multipart field name, throwing inside an unawaited promise. The unhandled rejection is fatal and terminates the server, so any authenticated uploader can cause a denial of service with a single request."
+  }
+}

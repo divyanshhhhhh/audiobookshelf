@@ -37,3 +37,5 @@ nmap-post-deploy.txt
 post-deploy-validation.log
 zap-out/
 .semgrep-venv/
+security-tests-results.json
+sectest-container.log
