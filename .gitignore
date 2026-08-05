@@ -31,3 +31,5 @@ tailwind.config.js
 /sectest-metadata/
 /sectest-media/
 /server.log
+
+/eslint-security.json

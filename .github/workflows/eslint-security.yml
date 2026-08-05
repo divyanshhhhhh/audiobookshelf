@@ -1,0 +1,78 @@
+name: ESLint Security
+
+# Runs eslint-plugin-security over the server code. This is advisory: it reports
+# findings and uploads them, and does not fail the build, because the plugin's
+# heuristics produce false positives that are not worth blocking a merge on.
+#
+# Scoped to index.js and server/ only. The client/ tree is Vue and would need
+# vue-eslint-parser configured before it could be linted this way.
+#
+# `security/detect-object-injection` is disabled in .eslintrc.security.json: it
+# flags essentially every computed property access and drowns the useful rules.
+on:
+  pull_request:
+  push:
+    branches: [ master ]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  eslint-security:
+    name: ESLint security plugin
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      # Pinned, and installed with --no-save so package.json is untouched.
+      # eslint is held at 8.x because the config above is in eslintrc format.
+      - name: install eslint and the security plugin
+        run: npm install --no-save --no-audit --no-fund eslint@8.57.0 eslint-plugin-security@2.1.1
+
+      - name: run eslint
+        run: |
+          set -uo pipefail
+          npx eslint index.js server \
+            --no-eslintrc \
+            --config .eslintrc.security.json \
+            --ext .js \
+            -f json -o eslint-security.json || ESLINT_EXIT=$?
+          # eslint exits 1 when it reports problems and 2 on a configuration or
+          # internal error. Only the latter means this step is broken.
+          if [ "${ESLINT_EXIT:-0}" -gt 1 ]; then
+            echo "::error::eslint failed to run (exit ${ESLINT_EXIT})"
+            exit 1
+          fi
+          test -s eslint-security.json
+
+      - name: summarise
+        if: always()
+        run: |
+          set -euo pipefail
+          test -s eslint-security.json || exit 0
+          COUNT=$(jq '[.[].messages[]] | length' eslint-security.json)
+          {
+            echo "### ESLint security plugin"
+            echo ""
+            echo "Findings: **$COUNT**"
+            echo ""
+            echo "| Rule | Count |"
+            echo "|---|---:|"
+            jq -r '[.[].messages[].ruleId] | group_by(.) | map({rule: .[0], n: length})
+                   | sort_by(-.n)[] | "| \(.rule) | \(.n) |"' eslint-security.json
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eslint-security-report
+          path: eslint-security.json
+          if-no-files-found: warn

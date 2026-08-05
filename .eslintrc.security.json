@@ -1,0 +1,32 @@
+{
+  "root": true,
+  "env": {
+    "node": true,
+    "es2022": true
+  },
+  "parserOptions": {
+    "ecmaVersion": 2022,
+    "sourceType": "script"
+  },
+  "plugins": ["security"],
+  "extends": ["plugin:security/recommended-legacy"],
+  "ignorePatterns": [
+    "node_modules/",
+    "client/",
+    "coverage/",
+    "dist/",
+    "build/",
+    "test/"
+  ],
+  "rules": {
+    "security/detect-non-literal-fs-filename": "warn",
+    "security/detect-non-literal-regexp": "warn",
+    "security/detect-object-injection": "off",
+    "security/detect-unsafe-regex": "error",
+    "security/detect-child-process": "error",
+    "security/detect-eval-with-expression": "error",
+    "security/detect-no-csrf-before-method-override": "error",
+    "security/detect-possible-timing-attacks": "warn",
+    "security/detect-pseudoRandomBytes": "error"
+  }
+}
