@@ -9,7 +9,7 @@
     "sourceType": "script"
   },
   "plugins": ["security"],
-  "extends": ["plugin:security/recommended"],
+  "extends": ["plugin:security/recommended-legacy"],
   "ignorePatterns": [
     "node_modules/",
     "client/",

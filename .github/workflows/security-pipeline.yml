@@ -86,6 +86,11 @@ jobs:
       # The repository has no ESLint dependency of its own, so versions are
       # pinned here. eslint 9 removed --no-eslintrc and --ext, which is why the
       # previous inline-config version of this step silently produced no output.
+      # The config extends `plugin:security/recommended-legacy`, not
+      # `plugin:security/recommended`. Even in eslint-plugin-security 2.1.1 the
+      # `recommended` export is flat-config shaped (`plugins` is an object), so
+      # eslintrc rejects it and eslint crashes with exit 2 while formatting the
+      # validation error. `recommended-legacy` is the eslintrc-compatible export.
       - name: ESLint with security plugin
         timeout-minutes: 5
         run: |
@@ -196,9 +201,12 @@ jobs:
         run: |
           set -euo pipefail
           if ! command -v trivy &> /dev/null; then
-            wget -q https://github.com/aquasecurity/trivy/releases/download/v0.49.1/trivy_0.49.1_Linux-64bit.deb
-            sudo dpkg -i trivy_0.49.1_Linux-64bit.deb
-            rm -f trivy_0.49.1_Linux-64bit.deb
+            # Pinned to a release that still publishes .deb assets. v0.49.1 was
+            # previously pinned here but its Debian packages are no longer
+            # downloadable, so this step returned 404 and failed the SCA job.
+            wget -q https://github.com/aquasecurity/trivy/releases/download/v0.73.0/trivy_0.73.0_Linux-64bit.deb
+            sudo dpkg -i trivy_0.73.0_Linux-64bit.deb
+            rm -f trivy_0.73.0_Linux-64bit.deb
           fi
           trivy --version
 

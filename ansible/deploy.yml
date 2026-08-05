@@ -19,16 +19,42 @@
     data_root: /home/ubuntu/abs-hardened-data
     app_container: abs-hardened
     proxy_container: abs-caddy
+    proxy_service: caddy   # compose service name, distinct from container_name
 
   tasks:
-    - name: Ensure required OS packages are present
+    # This deliberately verifies Docker rather than installing `docker.io`.
+    # The previous version installed Ubuntu's `docker.io` package unconditionally.
+    # On any host running Docker CE from Docker's own apt repository (which is
+    # what this runner uses) those packages conflict, so the task would have
+    # removed docker-ce and containerd.io part way through the deployment,
+    # taking the self-hosted runner and every running container with it.
+    # Docker is a prerequisite of the runner itself, so verifying is correct;
+    # installation is only attempted when no Docker is present at all.
+    - name: Check whether Docker is already installed
+      command: docker --version
+      register: docker_version
+      changed_when: false
+      failed_when: false
+
+    - name: Install Docker only when the host has none
       apt:
         name:
           - docker.io
           - docker-compose-plugin
         state: present
         update_cache: yes
-      when: ansible_os_family == "Debian"
+      when:
+        - ansible_os_family == "Debian"
+        - docker_version.rc != 0
+
+    - name: Verify the Docker Compose v2 plugin is available
+      command: docker compose version
+      register: compose_version
+      changed_when: false
+
+    - name: Show detected Docker toolchain
+      debug:
+        msg: "Docker server {{ docker_version.stdout | default('newly installed') }} / {{ compose_version.stdout }}"
 
     - name: Ensure Docker service is running
       service:
@@ -53,6 +79,7 @@
         src: ../docker/Caddyfile
         dest: "{{ deploy_dir }}/Caddyfile"
         mode: "0640"
+      register: caddyfile_copy
 
     - name: Ensure data directories exist with correct ownership
       file:
@@ -76,6 +103,14 @@
       command: docker compose -f {{ deploy_dir }}/docker-compose.yml up -d
       register: up_result
       changed_when: "'Started' in up_result.stderr or 'Created' in up_result.stderr"
+
+    # The Caddyfile is bind mounted, so `up -d` sees no change to the container
+    # spec and leaves the proxy running with its previous configuration. Without
+    # this, an edited Caddyfile would appear to deploy successfully while the
+    # running proxy still served the old config.
+    - name: Restart reverse proxy when its configuration changed
+      command: docker compose -f {{ deploy_dir }}/docker-compose.yml restart {{ proxy_service }}
+      when: caddyfile_copy.changed
 
     - name: Wait for application healthcheck to pass
       shell: |

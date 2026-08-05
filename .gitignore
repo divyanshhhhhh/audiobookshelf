@@ -24,3 +24,16 @@ sw.*
 .idea/*
 tailwind.compiled.css
 tailwind.config.js
+
+# DevSecOps pipeline scan output (uploaded as workflow artifacts, not source)
+semgrep-results.sarif
+eslint-security.json
+gitleaks-report.json
+npm-audit.json
+trivy-fs.json
+trivy-image.json
+trivy-post-deploy.txt
+nmap-post-deploy.txt
+post-deploy-validation.log
+zap-out/
+.semgrep-venv/

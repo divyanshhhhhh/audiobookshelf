@@ -1,11 +1,26 @@
 # Enforce HTTPS + secure headers + restrict sensitive endpoints
 # Replace localhost with your real hostname for a trusted cert in production use.
 
+# Automatic redirects are disabled because this stack is published on
+# non-standard host ports (13380/13443). Caddy's generated redirect would point
+# at port 443, which is not reachable from the host; the explicit :80 site below
+# redirects to the correct external port instead.
+{
+	auto_https disable_redirects
+}
+
 :80 {
 	redir https://{host}:13443{uri} permanent
 }
 
-:443 {
+# The site address must name a host. A bare `:443` site gives `tls internal` no
+# subject to issue a certificate for, so Caddy aborted every TLS handshake with
+# an internal error and the deployment served no HTTPS at all.
+# `bind 0.0.0.0` is required because naming a host would otherwise bind only the
+# loopback interface inside the container, which the published port cannot reach.
+https://localhost, https://127.0.0.1 {
+	bind 0.0.0.0
+
 	tls internal   # swap for a real cert (Let's Encrypt) once you have a public domain
 
 	encode gzip
@@ -22,7 +37,10 @@
 	# Restrict access to admin/config endpoints to local network only
 	@adminPaths path /config* /api/settings*
 	handle @adminPaths {
-		@notLocal not remote_ip 192.168.0.0/16 10.0.0.0/8
+		# All three RFC1918 ranges plus loopback. 172.16.0.0/12 was missing, which
+		# matters because Docker bridge networks live in that range, so traffic
+		# arriving through the proxy was treated as external.
+		@notLocal not remote_ip 192.168.0.0/16 10.0.0.0/8 172.16.0.0/12 127.0.0.1/8
 		respond @notLocal 403
 		reverse_proxy audiobookshelf:80
 	}
