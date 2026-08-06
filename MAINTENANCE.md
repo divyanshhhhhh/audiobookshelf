@@ -46,7 +46,100 @@ batch into next maintenance cycle; LOW/INFO → log and revisit quarterly.**
 - Re-run `post-deploy-validate.sh` after every version bump; treat any new
   FAIL as a blocker, not a warning.
 
-## 5. Developer engagement record
+## 5. Merge gating: required checks and the baseline ratchet
+
+### Required status checks on `master`
+
+`master` requires a pull request, and these four checks must pass before the
+merge button is enabled. The names must match the job `name:` values in
+`.github/workflows/security-pipeline.yml` character for character:
+
+| Required check | Job |
+|---|---|
+| `Static Code Analysis (SAST)` | `static-analysis` |
+| `Open Source Dependency & Image Scanning (SCA)` | `dependency-scan` |
+| `Application Security Test Cases` | `security-tests` |
+| `Security Gate` | `security-gate` |
+
+Two jobs are deliberately **not** required:
+
+- **Developer Notification** runs `if: always()`, so it reports success even
+  when the stages before it failed. Requiring it would add a check that can
+  never block anything, which makes the protection look stronger than it is.
+- **Automated Secure Deployment** is skipped on `pull_request` events by
+  design. A required check that never runs on pull requests leaves them
+  permanently pending and unmergeable.
+
+To review or change the rule: **Settings > Rules > Rulesets** on the
+repository, or `gh api repos/:owner/:repo/rulesets`.
+
+### The two baselines, which do different jobs
+
+| File | Scope | Gate behaviour |
+|---|---|---|
+| `security-tests-baseline.json` | Named test IDs known to fail | A failing test **not** listed here is a regression and fails `Application Security Test Cases` |
+| `security-baseline.json` | Numeric finding counts | A count **exceeding** the recorded number fails `Security Gate` |
+
+Both are delta gates, not absolute ones. The codebase currently carries 65
+HIGH/CRITICAL image CVEs, 25 npm audit findings and six failing security tests
+against unpatched upstream code. An absolute gate would be red on every run
+forever, and a check that can never pass gets bypassed, disabled or merged
+around, which leaves less protection than no gate at all. Blocking only on
+"worse than last time" is a standard that can actually be held.
+
+### The ratchet rule
+
+**Lower a baseline number in the same commit as the fix that lowers it.**
+
+That way the standard only ever moves downward, and it cannot quietly drift
+back up: raising a number is a visible diff in a pull request that a reviewer
+has to approve, with a reason attached. If the numbers were updated separately,
+or refreshed automatically from the latest run, the baseline would simply track
+whatever the codebase does and stop being a standard at all.
+
+The same applies to `security-tests-baseline.json`: when a test starts passing,
+the runner prints a note asking for its entry to be removed, and that removal
+belongs in the commit that fixed it. After removal, any regression fails CI.
+
+To re-record the numeric baseline after a deliberate change, read them from a
+completed run rather than from memory:
+
+```bash
+gh run download <run-id> -D /tmp/base
+jq 'length' /tmp/base/sast-reports/gitleaks-report.json
+jq '.metadata.vulnerabilities.critical, .metadata.vulnerabilities.high' /tmp/base/sca-reports/npm-audit.json
+jq '[.Results[]?.Vulnerabilities[]?] | length' /tmp/base/sca-reports/trivy-image.json
+```
+
+### Strict mode for the security tests
+
+`scripts/security-tests.sh` takes `SECTEST_STRICT`:
+
+| Value | Behaviour |
+|---|---|
+| unset or `0` (default) | Fails only on a regression or an error |
+| `1` | Fails if **any** test is failing or errored, and lists the failing IDs |
+
+CI uses the default. Strict mode is for a release candidate, or for a fork
+where the underlying defects have been fixed and the expected state is genuinely
+zero failures. It is not the default because six tests fail today, so a strict
+default would block every merge and would also stop the deploy job, which
+depends on the tests, from ever running, removing the deployment evidence the
+gate exists to protect.
+
+```bash
+SECTEST_STRICT=1 ./scripts/security-tests.sh http://localhost:18081
+```
+
+### Semgrep results in the Security tab
+
+The SAST job publishes `semgrep-results.sarif` to GitHub code scanning, so
+findings appear as inline annotations on the changed lines of a pull request,
+and GitHub distinguishes alerts that are new in the branch from ones already
+present on `master`. This needs `security-events: write`, which is set at the
+workflow level. Code scanning is free on public repositories.
+
+## 6. Developer engagement record
 Log every interaction with the Audiobookshelf maintainers/community here (link
 to Discussion threads, PR comments, Discord messages — redact usernames/emails
 per submission rules) as ongoing evidence of the "Developer Reuse Evidence"

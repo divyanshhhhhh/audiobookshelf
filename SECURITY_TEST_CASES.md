@@ -62,6 +62,52 @@ When a finding is fixed upstream, its test starts passing and the harness says
 so explicitly, prompting removal of the baseline entry so that any later
 regression fails the build.
 
+### Strict mode
+
+`scripts/security-tests.sh` reads `SECTEST_STRICT`:
+
+| Value | Behaviour |
+|---|---|
+| unset or `0` (default) | Exit non-zero only on a regression (a failure not in the baseline) or an error |
+| `1` | Exit non-zero if **any** test is failing or errored, listing the failing IDs |
+
+The script prints which mode it ran in on every invocation, so a log never
+leaves it ambiguous which standard was applied.
+
+The default is not strict on purpose. Six of the seven tests fail today against
+unpatched upstream code, so a strict default would mark every commit red and
+block every merge. It would also stop the deploy job, which depends on this one,
+from ever running, which would remove the deployment evidence the gate exists to
+protect. A check that can never pass is a check people learn to route around.
+
+Strict mode is the right setting for a release candidate, or for a fork where
+the underlying defects have been fixed and the expected state is genuinely zero.
+
+### Merge gating
+
+Two separate baselines gate merges into `master`, and they answer different
+questions:
+
+| File | Scope | Enforced by |
+|---|---|---|
+| `security-tests-baseline.json` | Named test IDs known to fail | `Application Security Test Cases` |
+| `security-baseline.json` | Numeric finding counts (gitleaks, npm audit, Trivy image, test regressions) | `Security Gate` |
+
+`Security Gate` fails when an observed count **exceeds** the recorded number, so
+it blocks changes that make things worse without blocking on the existing
+backlog. It prints every check as OK or FAIL with observed versus allowed, so
+the reasoning is visible in the log rather than implied by a red X.
+
+Both files ratchet in one direction: **a number is lowered in the same commit as
+the fix that lowers it**, so the standard tightens as defects are fixed and
+cannot drift back up without a visible, reviewable diff.
+
+The required checks on `master` are `Static Code Analysis (SAST)`,
+`Open Source Dependency & Image Scanning (SCA)`,
+`Application Security Test Cases` and `Security Gate`. See `MAINTENANCE.md`
+section 5 for why Developer Notification and Automated Secure Deployment are
+deliberately excluded.
+
 ## Test environment
 
 The job starts its own container (`abs-sectest`) from the image built by the

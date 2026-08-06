@@ -1,0 +1,30 @@
+{
+  "_comment": [
+    "Delta gate thresholds for the Security Gate job.",
+    "",
+    "The gate fails when an observed count EXCEEDS the number recorded here. It does",
+    "not fail on the findings that already exist. The point is to block changes that",
+    "make the codebase worse, not to block on a backlog nobody can clear in one pull",
+    "request. An absolute gate on a codebase with 65 existing image CVEs would be red",
+    "permanently, and a check that is always red is one people learn to route around,",
+    "which is worse than having no check at all.",
+    "",
+    "Lowering a number here is done in the SAME COMMIT as the fix that lowers it.",
+    "That way the standard only ever ratchets downward and cannot quietly drift back",
+    "up: raising a number is a visible, reviewable diff that has to be justified.",
+    "",
+    "Recorded from run 31035323629 on master (commit 527d015), which is the run whose",
+    "artifacts these numbers were read from. Do not edit them by hand from memory."
+  ],
+  "_source": {
+    "run_id": 31035323629,
+    "branch": "master",
+    "commit": "527d015",
+    "recorded": "2026-08-05"
+  },
+  "gitleaks": 0,
+  "npm_audit_critical": 3,
+  "npm_audit_high": 22,
+  "trivy_image_high_critical": 65,
+  "security_test_regressions": 0
+}
