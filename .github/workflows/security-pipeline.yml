@@ -13,6 +13,7 @@ on:
 permissions:
   contents: read
   issues: write
+  security-events: write   # required to publish Semgrep SARIF to code scanning
 
 env:
   IMAGE_NAME: audiobookshelf-hardened
@@ -156,6 +157,18 @@ jobs:
             echo "| ESLint (security plugin) | $ESLINT |"
             echo "| Gitleaks | $GITLEAKS |"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # Publishing the SARIF to code scanning gives two things the artifact
+      # cannot: inline annotations on the changed lines of a pull request, and
+      # GitHub's own comparison of which alerts are new in this branch versus
+      # already present on the base branch. Code scanning is free on public
+      # repositories.
+      - name: Upload Semgrep SARIF to code scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: semgrep-results.sarif
+          category: semgrep
 
       - name: Upload SAST artifacts
         if: always()
@@ -489,7 +502,95 @@ jobs:
           docker network rm "$SECTEST_NETWORK" || true
 
   # ---------------------------------------------------------------------------
-  # 5. Developer notification
+  # 5. Delta security gate
+  # ---------------------------------------------------------------------------
+  # Compares this run's counts against security-baseline.json and fails if any
+  # of them got worse. This is the job that makes a security regression block a
+  # merge, so it is one of the required status checks on master.
+  #
+  # Delta gating, not absolute gating. The codebase has 65 HIGH/CRITICAL image
+  # CVEs and 25 npm audit findings today, none of which a single pull request
+  # can clear. An absolute gate would be red on every run forever, and a check
+  # that can never pass gets bypassed, disabled, or merged around, which leaves
+  # less protection than having no gate at all. Blocking only on "worse than
+  # before" is a standard that can actually be enforced.
+  #
+  # Every check prints its observed and allowed value whether it passes or
+  # fails, so the evidence is in the log rather than only in a red X.
+  security-gate:
+    name: Security Gate
+    runs-on: self-hosted
+    needs: [ static-analysis, dependency-scan, security-tests ]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Evaluate findings against the committed baseline
+        run: |
+          set -euo pipefail
+          BASELINE=security-baseline.json
+          test -s "$BASELINE" || { echo "::error::$BASELINE is missing"; exit 1; }
+
+          # Observed values come from the upstream jobs' outputs.
+          declare -A OBSERVED=(
+            [gitleaks]="${{ needs.static-analysis.outputs.gitleaks_findings || 0 }}"
+            [npm_audit_critical]="${{ needs.dependency-scan.outputs.npm_critical || 0 }}"
+            [npm_audit_high]="${{ needs.dependency-scan.outputs.npm_high || 0 }}"
+            [trivy_image_high_critical]="${{ needs.dependency-scan.outputs.image_highcrit || 0 }}"
+            [security_test_regressions]="${{ needs.security-tests.outputs.security_test_regressions || 0 }}"
+          )
+
+          FAILED=0
+          {
+            echo "### Security gate"
+            echo ""
+            echo "Delta gate: a check fails only when the observed count exceeds the committed baseline."
+            echo ""
+            echo "| Check | Observed | Allowed | Result |"
+            echo "|---|---:|---:|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Security gate: comparing this run against $BASELINE"
+          echo ""
+          printf '%-28s %10s %10s   %s\n' "CHECK" "OBSERVED" "ALLOWED" "RESULT"
+
+          for KEY in gitleaks npm_audit_critical npm_audit_high trivy_image_high_critical security_test_regressions; do
+            ALLOWED=$(jq -r --arg k "$KEY" '.[$k]' "$BASELINE")
+            if [ "$ALLOWED" = "null" ]; then
+              echo "::error::$BASELINE has no entry for '$KEY'"
+              exit 1
+            fi
+            OBS="${OBSERVED[$KEY]}"
+            if [ "$OBS" -gt "$ALLOWED" ]; then
+              RESULT="FAIL"
+              FAILED=1
+              echo "::error::$KEY increased: observed $OBS, baseline allows $ALLOWED"
+            else
+              RESULT="OK"
+            fi
+            printf '%-28s %10s %10s   %s\n' "$KEY" "$OBS" "$ALLOWED" "$RESULT"
+            echo "| \`$KEY\` | $OBS | $ALLOWED | $RESULT |" >> "$GITHUB_STEP_SUMMARY"
+          done
+
+          echo ""
+          if [ "$FAILED" -ne 0 ]; then
+            echo "Security gate FAILED: at least one measure is worse than the committed baseline."
+            {
+              echo ""
+              echo "**Gate failed.** One or more measures are worse than \`security-baseline.json\`."
+              echo "Fix the regression, or, if the increase is justified and accepted, raise the"
+              echo "number in \`security-baseline.json\` in this pull request so the change is reviewed."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          echo "Security gate passed: nothing got worse."
+          {
+            echo ""
+            echo "**Gate passed.** No measure exceeded its baseline."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # 6. Developer notification
   # ---------------------------------------------------------------------------
   notify:
     name: Developer Notification
@@ -593,18 +694,20 @@ jobs:
         run: echo "No findings across any stage. No notification issue opened."
 
   # ---------------------------------------------------------------------------
-  # 6. Automated secure deployment (Part 2)
+  # 7. Automated secure deployment (Part 2)
   # ---------------------------------------------------------------------------
   # Failures are no longer swallowed by `|| echo`. If Ansible or the validation
   # script fails, this job fails, because a passing deploy job that deployed
   # nothing is worse than no deploy job at all.
   #
-  # This also depends on security-tests, so a security regression blocks the
-  # deployment rather than merely being reported after it.
+  # This also depends on security-tests and security-gate, so a security
+  # regression blocks the deployment rather than merely being reported after it.
+  # The gate is delta based and passes at the current baseline, so adding it
+  # here does not stop the deployment from running on an unchanged codebase.
   deploy:
     name: Automated Secure Deployment
     runs-on: self-hosted
-    needs: [ static-analysis, dependency-scan, dast-api-tests, security-tests ]
+    needs: [ static-analysis, dependency-scan, dast-api-tests, security-tests, security-gate ]
     if: success() && github.event_name != 'pull_request'
     steps:
       - uses: actions/checkout@v4

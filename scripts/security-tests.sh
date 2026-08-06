@@ -406,16 +406,54 @@ if [ -n "$FIXED" ]; then
   log "      remove them from $BASELINE_FILE so a future regression is caught."
 fi
 
+# ---------------------------------------------------------------------------
+# Exit policy
+# ---------------------------------------------------------------------------
+# Two modes, because "did anything fail" and "did anything get worse" are
+# different questions and only the second one can gate a merge here.
+#
+# Default (SECTEST_STRICT unset or 0): fail only on a regression, meaning a
+# failing test absent from the baseline, or on an error, meaning a test could
+# not execute so its result is meaningless.
+#
+# Strict (SECTEST_STRICT=1): fail if any test is failing or errored at all.
+#
+# Strict is deliberately NOT the default. Six of the seven tests currently fail
+# against unpatched upstream code. A strict default would therefore mark every
+# commit red, block every merge, and, because the deploy job depends on this
+# one, stop the deployment from ever running. That would destroy the very
+# evidence the gate exists to protect: a pipeline that can never go green tells
+# you nothing about whether a change made things worse, and teams quickly learn
+# to bypass a check that is permanently red.
+#
+# Strict mode is useful for a release candidate, or on a fork where the
+# underlying findings have been fixed and the expected state is genuinely zero.
+STRICT="${SECTEST_STRICT:-0}"
+
+FAILING_IDS=$(jq -r '[.results[] | select(.status=="fail" or .status=="error") | .id] | join(" ")' "$RESULTS_FILE")
+
 STATUS=0
-if [ -n "$ERRORED" ]; then
-  echo "::error::Security tests could not execute: $ERRORED. The harness or its fixtures are broken."
-  STATUS=1
-fi
-if [ -n "$REGRESSIONS" ]; then
-  echo "::error::Security regression detected in: $REGRESSIONS (failing, and not listed in the baseline)."
-  STATUS=1
-fi
-if [ "$STATUS" -eq 0 ] && [ "$FAIL" -gt 0 ]; then
-  log "$FAIL known-failing test(s) reported. These are unpatched findings recorded in $BASELINE_FILE, not regressions."
+if [ "$STRICT" = "1" ]; then
+  log "mode: STRICT (SECTEST_STRICT=1) - any failing or errored test fails this run"
+  if [ -n "$FAILING_IDS" ]; then
+    echo "::error::Strict mode: $FAIL failing and $ERROR errored test(s): $FAILING_IDS"
+    log "strict-mode failures: $FAILING_IDS"
+    STATUS=1
+  else
+    log "strict mode satisfied: no failing or errored tests"
+  fi
+else
+  log "mode: BASELINE (default) - only regressions and errors fail this run"
+  if [ -n "$ERRORED" ]; then
+    echo "::error::Security tests could not execute: $ERRORED. The harness or its fixtures are broken."
+    STATUS=1
+  fi
+  if [ -n "$REGRESSIONS" ]; then
+    echo "::error::Security regression detected in: $REGRESSIONS (failing, and not listed in the baseline)."
+    STATUS=1
+  fi
+  if [ "$STATUS" -eq 0 ] && [ "$FAIL" -gt 0 ]; then
+    log "$FAIL known-failing test(s) reported. These are unpatched findings recorded in $BASELINE_FILE, not regressions."
+  fi
 fi
 exit "$STATUS"
